@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    tags: [ 'v*.*.*' ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v1.0.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Validate, package & publish
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate on PowerShell 7
+        shell: pwsh
+        run: ./tests/Invoke-Tests.ps1
+
+      - name: Validate on Windows PowerShell 5.1
+        shell: powershell
+        run: ./tests/Invoke-Tests.ps1
+
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          $tag = if ($env:GITHUB_REF_NAME -like 'v*') { $env:GITHUB_REF_NAME } else { '${{ github.event.inputs.tag }}' }
+          if ([string]::IsNullOrWhiteSpace($tag)) { Write-Error 'No tag resolved.'; exit 1 }
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Releasing $tag"
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $tag   = '${{ steps.ver.outputs.tag }}'
+          $stage = "pfsense_report-$tag"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          foreach ($f in 'pfsense_report.ps1','README.md','LICENSE','CHANGELOG.md') {
+            if (Test-Path $f) { Copy-Item $f -Destination $stage }
+          }
+          $zip = "$stage.zip"
+          Compress-Archive -Path "$stage/*" -DestinationPath $zip -Force
+          foreach ($f in @($zip,'pfsense_report.ps1')) {
+            $hash = (Get-FileHash $f -Algorithm SHA256).Hash
+            "$hash  $([System.IO.Path]::GetFileName($f))" | Out-File "$f.sha256" -Encoding ascii
+          }
+          Get-ChildItem "$zip","$zip.sha256","pfsense_report.ps1.sha256" | Format-Table Name,Length
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ steps.ver.outputs.tag }}'
+          $assets = @("pfsense_report-$tag.zip", "pfsense_report-$tag.zip.sha256", "pfsense_report.ps1", "pfsense_report.ps1.sha256")
+          gh release create $tag --title "pfSense Report $tag" --generate-notes @assets

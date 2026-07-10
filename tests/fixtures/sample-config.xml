@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<pfsense>
+  <version>22.5</version>
+  <lastchange>1700000000</lastchange>
+  <system>
+    <hostname>demo-fw</hostname>
+    <domain>example.com</domain>
+    <group><name>admins</name><description><![CDATA[System Administrators]]></description><scope>system</scope><gid>1999</gid><member>0</member><priv>page-all</priv></group>
+    <user><name>admin</name><descr><![CDATA[System Administrator]]></descr><scope>system</scope><groupname>admins</groupname><bcrypt-hash>$2y$10$FAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfa</bcrypt-hash><uid>0</uid><priv>user-shell-access</priv></user>
+    <timeservers>pool.ntp.org</timeservers>
+    <timezone>UTC</timezone>
+    <webgui><protocol>https</protocol><port>443</port><ssl-certref>testcert1</ssl-certref></webgui>
+    <ssh><enable>enabled</enable></ssh>
+    <dnsserver>192.0.2.10</dnsserver>
+    <dnsserver>198.51.100.10</dnsserver>
+  </system>
+  <interfaces>
+    <wan><enable></enable><if>em0</if><descr><![CDATA[WAN]]></descr><ipaddr>dhcp</ipaddr><gateway>WANGW</gateway><blockbogons></blockbogons></wan>
+    <lan><enable></enable><if>em1</if><descr><![CDATA[LAN]]></descr><ipaddr>192.0.2.1</ipaddr><subnet>24</subnet></lan>
+    <opt1><enable></enable><if>em1.20</if><descr><![CDATA[GUEST]]></descr><ipaddr>198.51.100.1</ipaddr><subnet>24</subnet></opt1>
+  </interfaces>
+  <vlans><vlan><if>em1</if><tag>20</tag><vlanif>em1.20</vlanif><descr><![CDATA[Guest VLAN]]></descr></vlan></vlans>
+  <staticroutes><route><network>203.0.113.0/24</network><gateway>WANGW</gateway><descr><![CDATA[Remote net]]></descr></route></staticroutes>
+  <gateways><gateway_item><interface>wan</interface><gateway>192.0.2.254</gateway><name>WANGW</name><monitor>192.0.2.253</monitor><ipprotocol>inet</ipprotocol><descr><![CDATA[WAN GW]]></descr></gateway_item><defaultgw4>WANGW</defaultgw4></gateways>
+  <dhcpd><lan><enable></enable><range><from>192.0.2.100</from><to>192.0.2.199</to></range><gateway>192.0.2.1</gateway><domain>example.com</domain><dnsserver>192.0.2.10</dnsserver><staticmap><mac>00:11:22:33:44:55</mac><ipaddr>192.0.2.50</ipaddr><hostname>printer</hostname><descr><![CDATA[Office printer]]></descr></staticmap></lan></dhcpd>
+  <nat>
+    <outbound><mode>hybrid</mode><rule><interface>wan</interface><source><network>192.0.2.0/24</network></source><destination><any></any></destination><targetip>192.0.2.2</targetip><descr><![CDATA[Manual SNAT]]></descr></rule></outbound>
+    <rule><interface>wan</interface><protocol>tcp</protocol><destination><network>wanip</network><port>443</port></destination><target>192.0.2.20</target><local-port>443</local-port><descr><![CDATA[HTTPS to web server]]></descr></rule>
+    <onetoone><interface>wan</interface><external>203.0.113.10</external><source><address>192.0.2.30</address></source><destination><any></any></destination><descr><![CDATA[1:1 mapping]]></descr></onetoone>
+  </nat>
+  <filter>
+    <rule><type>pass</type><interface>wan</interface><protocol>icmp</protocol><icmptype>any</icmptype><source><any></any></source><destination><any></any></destination><descr><![CDATA[Allow ping from anywhere]]></descr></rule>
+    <rule><type>pass</type><interface>wan</interface><protocol>tcp</protocol><source><any></any></source><destination><any></any></destination><descr><![CDATA[DANGER wide open]]></descr></rule>
+    <rule><type>pass</type><interface>lan</interface><source><network>lan</network></source><destination><any></any></destination><descr><![CDATA[Default allow LAN]]></descr></rule>
+  </filter>
+  <ipsec>
+    <phase1><ikeid>1</ikeid><iketype>ikev2</iketype><interface>wan</interface><remote-gateway>203.0.113.50</remote-gateway><encryption><item><encryption-algorithm><name>aes</name><keylen>256</keylen></encryption-algorithm><hash-algorithm>sha256</hash-algorithm><dhgroup>14</dhgroup></item></encryption><lifetime>28800</lifetime><authentication_method>pre_shared_key</authentication_method><pre-shared-key>EXAMPLEPSKdonotuse</pre-shared-key><descr><![CDATA[Site VPN]]></descr></phase1>
+    <phase2><ikeid>1</ikeid><mode>tunnel</mode><localid><type>lan</type></localid><remoteid><type>network</type><address>203.0.113.0</address><netbits>24</netbits></remoteid><protocol>esp</protocol><encryption-algorithm-option><name>aes</name><keylen>256</keylen></encryption-algorithm-option><hash-algorithm-option>hmac_sha256</hash-algorithm-option><pfsgroup>14</pfsgroup><lifetime>3600</lifetime><descr><![CDATA[Site VPN P2]]></descr></phase2>
+  </ipsec>
+  <openvpn><openvpn-server><vpnid>1</vpnid><mode>server_tls_user</mode><authmode>Local Database</authmode><protocol>UDP4</protocol><dev_mode>tun</dev_mode><interface>wan</interface><local_port>1194</local_port><description><![CDATA[Remote Access]]></description><caref>testca1</caref><certref>testcert1</certref><data_ciphers>AES-256-GCM,AES-128-GCM</data_ciphers><data_ciphers_fallback>AES-256-CBC</data_ciphers_fallback><digest>SHA256</digest><tunnel_network>10.8.0.0/24</tunnel_network><local_network>192.0.2.0/24</local_network></openvpn-server></openvpn>
+  <unbound><enable></enable><active_interface></active_interface><hosts><host>nas</host><domain>example.com</domain><ip>192.0.2.40</ip><descr><![CDATA[NAS]]></descr></hosts></unbound>
+  <aliases><alias><name>Mgmt_Hosts</name><type>host</type><address>198.51.100.5 198.51.100.6</address><descr><![CDATA[Management hosts]]></descr></alias></aliases>
+  <installedpackages><package><name>openvpn-client-export</name><version>1.9</version><descr><![CDATA[OpenVPN Client Export Utility]]></descr></package></installedpackages>
+  <ca><refid>testca1</refid><descr><![CDATA[Example Root CA]]></descr><crt>LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUM2akNDQWRLZ0F3SUJBZ0lJUkR3OWpsbUR2c2t3RFFZSktvWklodmNOQVFFTEJRQXdOREVVTUJJR0ExVUUKQ2hNTFJYaGhiWEJzWlNCUGNtY3hIREFhQmdOVkJBTVRFMlJsYlc4dFpuY3VaWGhoYlhCc1pTNWpiMjB3SUJjTgpNalF3TVRBeE1EQXdNREF3V2hnUE1qQTVPVEF4TURFd01EQXdNREJhTURReEZEQVNCZ05WQkFvVEMwVjRZVzF3CmJHVWdUM0puTVJ3d0dnWURWUVFERXhOa1pXMXZMV1ozTG1WNFlXMXdiR1V1WTI5dE1JSUJJakFOQmdrcWhraUcKOXcwQkFRRUZBQU9DQVE4QU1JSUJDZ0tDQVFFQXo3dnM1QVBJMm1SUGJCK043RGJhTzM5MWhZQUs5SUtHTHY4UwpIck96byttbUR5V0g3ZWt3c3JrT3VkaHV2eWQ4MllYUTkxNllVcDI3Vm1qYmw2RUd3VlJQQm5XNXcrSEhKNWNsCmpPTW93UkxlY056S01oYzR1VXJGK01NUUFXMng3dlplaitJWFBDWlpyb2JZaTJZNndXQTYrcEk5bmoyU1VoVjMKYitxWmJUNzBYd3lFd2VSWXdmcTFWM2h3aENzdURTNG5IRkRIdFFINk84VWN4VWdXTTBhNzRaT0hDcmVJZFhEYQovZWlWcXVVVlVVcm94bndzQngyM200ZC9USHkxMVVXUnBiRzNNcklFUlQ4VFJxM05sL3F0c2lqU1BDRWtJYmZsCndVQTBHYkxCSWg2QmNGVlowa0hlMndNWGM4c2I3aGI0UVZkZHIwamZPWURNNnJPSmtRSURBUUFCTUEwR0NTcUcKU0liM0RRRUJDd1VBQTRJQkFRQnF0SXh1RXFiaFNWNjlSempDN3J3bG1FM2ZkRFl5SmhaMldIYklISVpMc3VvTAp0RmxwSTBmNENFdjlqY3VGdnZmUWMxOUl4K3lYSDZwUDc3cDFVVitLbkh0eTh6b3c0RUp4V1JCc2dobzJQTkZlClBXa0U0M29PdEx5VG5wWjJzUXFTTGsya3lYeGEvUFg5M0pVZzBjYlpSY2JEK3YrcVg1MjhCOFRJeXpzeEdNRlEKNWNyR0JwMnI0RnFua01TTW0yN3lmS2g4amVtNFdxWVpmbW5UYU9IVXRQUm5aOFRJWTgrSVZEM3dmejdFSnV0ZAppcXlYUFJoWWVFUnNLRWtwcElNblZZbllpM21NSVBTdzk2dWhGUnR1ZnREMitNSUVEWTRjSmNqYzVMZzgrTjdVCisvUUhNNWJ1a1UvQTN0TngyWnJhUllRc2xvMnFFOS8rK1FHZWgySDAKLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=</crt></ca>
+  <cert><refid>testcert1</refid><descr><![CDATA[webConfigurator default]]></descr><type>server</type><crt>LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUM2akNDQWRLZ0F3SUJBZ0lJUkR3OWpsbUR2c2t3RFFZSktvWklodmNOQVFFTEJRQXdOREVVTUJJR0ExVUUKQ2hNTFJYaGhiWEJzWlNCUGNtY3hIREFhQmdOVkJBTVRFMlJsYlc4dFpuY3VaWGhoYlhCc1pTNWpiMjB3SUJjTgpNalF3TVRBeE1EQXdNREF3V2hnUE1qQTVPVEF4TURFd01EQXdNREJhTURReEZEQVNCZ05WQkFvVEMwVjRZVzF3CmJHVWdUM0puTVJ3d0dnWURWUVFERXhOa1pXMXZMV1ozTG1WNFlXMXdiR1V1WTI5dE1JSUJJakFOQmdrcWhraUcKOXcwQkFRRUZBQU9DQVE4QU1JSUJDZ0tDQVFFQXo3dnM1QVBJMm1SUGJCK043RGJhTzM5MWhZQUs5SUtHTHY4UwpIck96byttbUR5V0g3ZWt3c3JrT3VkaHV2eWQ4MllYUTkxNllVcDI3Vm1qYmw2RUd3VlJQQm5XNXcrSEhKNWNsCmpPTW93UkxlY056S01oYzR1VXJGK01NUUFXMng3dlplaitJWFBDWlpyb2JZaTJZNndXQTYrcEk5bmoyU1VoVjMKYitxWmJUNzBYd3lFd2VSWXdmcTFWM2h3aENzdURTNG5IRkRIdFFINk84VWN4VWdXTTBhNzRaT0hDcmVJZFhEYQovZWlWcXVVVlVVcm94bndzQngyM200ZC9USHkxMVVXUnBiRzNNcklFUlQ4VFJxM05sL3F0c2lqU1BDRWtJYmZsCndVQTBHYkxCSWg2QmNGVlowa0hlMndNWGM4c2I3aGI0UVZkZHIwamZPWURNNnJPSmtRSURBUUFCTUEwR0NTcUcKU0liM0RRRUJDd1VBQTRJQkFRQnF0SXh1RXFiaFNWNjlSempDN3J3bG1FM2ZkRFl5SmhaMldIYklISVpMc3VvTAp0RmxwSTBmNENFdjlqY3VGdnZmUWMxOUl4K3lYSDZwUDc3cDFVVitLbkh0eTh6b3c0RUp4V1JCc2dobzJQTkZlClBXa0U0M29PdEx5VG5wWjJzUXFTTGsya3lYeGEvUFg5M0pVZzBjYlpSY2JEK3YrcVg1MjhCOFRJeXpzeEdNRlEKNWNyR0JwMnI0RnFua01TTW0yN3lmS2g4amVtNFdxWVpmbW5UYU9IVXRQUm5aOFRJWTgrSVZEM3dmejdFSnV0ZAppcXlYUFJoWWVFUnNLRWtwcElNblZZbllpM21NSVBTdzk2dWhGUnR1ZnREMitNSUVEWTRjSmNqYzVMZzgrTjdVCisvUUhNNWJ1a1UvQTN0TngyWnJhUllRc2xvMnFFOS8rK1FHZWgySDAKLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=</crt><prv>NOT-A-REAL-PRIVATE-KEY</prv></cert>
+  <revision><time>1700000000</time><description><![CDATA[admin@192.0.2.100 (Local Database): saved a firewall rule]]></description><username><![CDATA[admin@192.0.2.100 (Local Database)]]></username></revision>
+</pfsense>

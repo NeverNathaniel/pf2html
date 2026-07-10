@@ -1,0 +1,25 @@
+# ---------------------------------------------------------------------------
+# NEVER commit generated reports or real pfSense configs — they contain
+# pre-shared keys, IP addresses, hostnames and other sensitive data.
+# ---------------------------------------------------------------------------
+reports/
+*.html
+
+# Real pfSense configuration backups
+config-*.xml
+*config*.xml
+
+# ...but DO keep the sanitized test fixture
+!tests/fixtures/
+!tests/fixtures/**
+
+# Local logos / scratch
+logo.*
+*.tmp
+*.log
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vs/
+.vscode/
