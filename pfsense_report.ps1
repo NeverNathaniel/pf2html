@@ -105,7 +105,7 @@ function Initialize-ReportContext {
         [int]$ExpiryWarnDaysValue = 90,
         [datetime]$NowValue = (Get-Date)
     )
-    $script:IsRedacted             = $RedactMode
+    $script:IsRedacted         = $RedactMode
     $script:RedactHost         = $null
     $script:RedactDomain       = $null
     $script:ExpiryWarnDays     = $ExpiryWarnDaysValue
@@ -126,7 +126,7 @@ function Initialize-ReportContext {
 Initialize-ReportContext -RedactMode ([bool]$Redact) -ExpiryWarnDaysValue $ExpiryWarnDays
 
 # ==================================================================================
-#  HELPER FUNCTIONS
+#  CORE I/O, XML & REDACTION HELPERS
 # ==================================================================================
 
 function Resolve-FullPath {
@@ -145,8 +145,8 @@ function Read-PfSenseXml {
         throw "Config file not found: $PathValue"
     }
     $settings = New-Object System.Xml.XmlReaderSettings
-    $settings.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
-    $settings.XmlResolver = $null
+    $settings.DtdProcessing  = [System.Xml.DtdProcessing]::Prohibit
+    $settings.XmlResolver    = $null
     $settings.IgnoreComments = $true
     $xml = New-Object System.Xml.XmlDocument
     $xml.XmlResolver = $null
@@ -188,26 +188,21 @@ function Test-IsRedactToken {
 
 function Apply-Redaction {
     param([string]$text)
-    if (-not $script:IsRedacted) { return $text }
-    if ([string]::IsNullOrEmpty($text)) { return $text }
+    if (-not $script:IsRedacted -or [string]::IsNullOrEmpty($text)) { return $text }
     $t = $text
 
     # 1. MAC addresses (colon or hyphen delimited, consistent separator) -> MAC-NNN
     $t = [regex]::Replace($t, '(?i)(?<![0-9a-f:-])([0-9a-f]{2})([:-])(?:[0-9a-f]{2}\2){4}[0-9a-f]{2}(?![0-9a-f:-])',
         [System.Text.RegularExpressions.MatchEvaluator] {
             param($m)
-            $norm = ($m.Value -replace '-', ':').ToLowerInvariant()
-            return (Get-RedactToken $norm 'MAC')
+            return (Get-RedactToken ($m.Value -replace '-', ':').ToLowerInvariant() 'MAC')
         })
 
     # 2. IPv4 addresses (valid 0-255 octets, not part of longer dotted OID/version) -> IP-NNN
     $t = [regex]::Replace($t, '(?<![.\d])(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?![.\d])',
         [System.Text.RegularExpressions.MatchEvaluator] {
             param($m)
-            for ($i = 1; $i -le 4; $i++) {
-                $oct = [int]$m.Groups[$i].Value
-                if ($oct -gt 255) { return $m.Value }
-            }
+            for ($i = 1; $i -le 4; $i++) { if ([int]$m.Groups[$i].Value -gt 255) { return $m.Value } }
             return (Get-RedactToken $m.Value 'IP')
         })
 
@@ -217,9 +212,8 @@ function Apply-Redaction {
         [System.Text.RegularExpressions.MatchEvaluator] {
             param($m)
             $cand = $m.Value
-            $hasDouble = $cand.Contains('::')
             $colonCount = @($cand.ToCharArray() | Where-Object { $_ -eq ':' }).Count
-            if (-not $hasDouble -and $colonCount -lt 7) { return $cand }
+            if (-not $cand.Contains('::') -and $colonCount -lt 7) { return $cand }
             if ($cand -eq '::') { return $cand }
             $ipObj = $null
             if ([System.Net.IPAddress]::TryParse($cand, [ref]$ipObj) -and
@@ -236,13 +230,11 @@ function Apply-Redaction {
             $uTok = Get-RedactToken $m.Groups[1].Value.ToLowerInvariant() 'USER'
             $domPart = $m.Groups[2].Value
             if (Test-IsRedactToken $domPart) { return ($uTok + '@' + $domPart) }
-            if ($script:RedactDomain -and $domPart -ieq $script:RedactDomain) {
-                return ($uTok + '@' + (Get-RedactToken $script:RedactDomain 'DOMAIN'))
-            }
-            return ($uTok + '@' + (Get-RedactToken $domPart.ToLowerInvariant() 'DOMAIN'))
+            $domKey = if ($script:RedactDomain -and $domPart -ieq $script:RedactDomain) { $script:RedactDomain } else { $domPart.ToLowerInvariant() }
+            return ($uTok + '@' + (Get-RedactToken $domKey 'DOMAIN'))
         })
 
-    # 5. FQDNs (preserve HOST-NNN.DOMAIN-NNN correlation with system domain; skip generated tokens & filenames)
+    # 5. FQDNs (preserve HOST-NNN.DOMAIN-NNN correlation; skip generated tokens & filenames)
     $skipExts = @('ps1','xml','html','htm','php','sh','conf','cfg','pem','crt','cer','key','log','json','csv','txt','zip','tar','gz','exe','dll','png','jpg','jpeg','gif','svg','webp','pdf','md')
     $t = [regex]::Replace($t, '(?i)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{1,62}\b',
         [System.Text.RegularExpressions.MatchEvaluator] {
@@ -250,14 +242,9 @@ function Apply-Redaction {
             $val = $m.Value
             if (Test-IsRedactToken $val) { return $val }
             $lastDot = $val.LastIndexOf('.')
-            if ($lastDot -gt 0) {
-                $ext = $val.Substring($lastDot + 1).ToLowerInvariant()
-                if ($skipExts -contains $ext) { return $val }
-            }
+            if ($lastDot -gt 0 -and ($skipExts -contains $val.Substring($lastDot + 1).ToLowerInvariant())) { return $val }
             if ($script:RedactDomain) {
-                if ($val -ieq $script:RedactDomain) {
-                    return (Get-RedactToken $script:RedactDomain 'DOMAIN')
-                }
+                if ($val -ieq $script:RedactDomain) { return (Get-RedactToken $script:RedactDomain 'DOMAIN') }
                 $suffix = '.' + $script:RedactDomain
                 if ($val.Length -gt $suffix.Length -and $val.EndsWith($suffix, [System.StringComparison]::OrdinalIgnoreCase)) {
                     $hostPart = $val.Substring(0, $val.Length - $suffix.Length)
@@ -267,23 +254,22 @@ function Apply-Redaction {
             return (Get-RedactToken $val.ToLowerInvariant() 'HOST')
         })
 
-    # 6. Specific system domain / bare hostname with strict word boundaries (no substring mangling)
-    if ($script:RedactDomain) {
-        $domTok = Get-RedactToken $script:RedactDomain 'DOMAIN'
-        $pat = '(?i)(?<![a-z0-9_-])' + [regex]::Escape($script:RedactDomain) + '(?![a-z0-9_-])'
-        $t = [regex]::Replace($t, $pat, [System.Text.RegularExpressions.MatchEvaluator] { param($m) $null = $m; return $domTok })
+    # 6. Specific system domain / bare hostname with strict word boundaries
+    foreach ($pair in @(@($script:RedactDomain, 'DOMAIN'), @($script:RedactHost, 'HOST'))) {
+        if ($pair[0]) {
+            $tok = Get-RedactToken $pair[0] $pair[1]
+            $pat = '(?i)(?<![a-z0-9_-])' + [regex]::Escape($pair[0]) + '(?![a-z0-9_-])'
+            $t = [regex]::Replace($t, $pat, [System.Text.RegularExpressions.MatchEvaluator] { param($m) $null = $m; return $tok })
+        }
     }
-    if ($script:RedactHost) {
-        $hostTok = Get-RedactToken $script:RedactHost 'HOST'
-        $pat = '(?i)(?<![a-z0-9_-])' + [regex]::Escape($script:RedactHost) + '(?![a-z0-9_-])'
-        $t = [regex]::Replace($t, $pat, [System.Text.RegularExpressions.MatchEvaluator] { param($m) $null = $m; return $hostTok })
-    }
-
     return $t
 }
 
+# ==================================================================================
+#  HTML ENCODING & DECLARATIVE TABLE HELPERS
+# ==================================================================================
+
 function E {
-    # Encode a raw data value for safe HTML output (applies redaction first).
     param([object]$s)
     if ($null -eq $s) { return '' }
     $str = [string]$s
@@ -292,25 +278,19 @@ function E {
 }
 
 function E-Host {
-    # Encode a hostname field: under -Redact, even single-label hostnames become HOST-NNN.
     param([object]$s)
-    if ($null -eq $s) { return '' }
-    $str = ([string]$s).Trim()
+    $str = if ($null -eq $s) { '' } else { ([string]$s).Trim() }
     if ([string]::IsNullOrWhiteSpace($str)) { return '<span class="muted">&mdash;</span>' }
     if ($script:IsRedacted) {
-        if ($str.Contains('.') -or $str.Contains(':')) {
-            return (E $str)
-        }
+        if ($str.Contains('.') -or $str.Contains(':')) { return (E $str) }
         return [System.Net.WebUtility]::HtmlEncode((Get-RedactToken $str.ToLowerInvariant() 'HOST'))
     }
     return [System.Net.WebUtility]::HtmlEncode($str)
 }
 
 function E-User {
-    # Encode a username field: under -Redact, local usernames become USER-NNN.
     param([object]$s)
-    if ($null -eq $s) { return '' }
-    $str = ([string]$s).Trim()
+    $str = if ($null -eq $s) { '' } else { ([string]$s).Trim() }
     if ([string]::IsNullOrWhiteSpace($str)) { return '<span class="muted">&mdash;</span>' }
     if ($script:IsRedacted) {
         if ($str -match '@') { return (E $str) }
@@ -320,27 +300,21 @@ function E-User {
 }
 
 function E-CertDn {
-    # Encode an X.509 Distinguished Name; under -Redact also masks O/OU/L/ST/email attributes.
     param([object]$s)
-    if ($null -eq $s) { return '<span class="muted">&mdash;</span>' }
-    $str = ([string]$s).Trim()
+    $str = if ($null -eq $s) { '' } else { ([string]$s).Trim() }
     if ([string]::IsNullOrWhiteSpace($str)) { return '<span class="muted">&mdash;</span>' }
     if ($script:IsRedacted) {
         $str = [regex]::Replace($str, '(?i)\b(O|OU|L|ST|S|STREET)=([^,]+)',
             [System.Text.RegularExpressions.MatchEvaluator] {
                 param($m)
-                $attr = $m.Groups[1].Value
-                $val  = $m.Groups[2].Value.Trim()
-                return ($attr + '=' + (Get-RedactToken $val 'ORG'))
+                return ($m.Groups[1].Value + '=' + (Get-RedactToken $m.Groups[2].Value.Trim() 'ORG'))
             })
         $str = [regex]::Replace($str, '(?i)\b(CN)=([^,]+)',
             [System.Text.RegularExpressions.MatchEvaluator] {
                 param($m)
                 $val = $m.Groups[2].Value.Trim()
                 $red = Apply-Redaction $val
-                if ($red -eq $val -and -not (Test-IsRedactToken $val)) {
-                    $red = Get-RedactToken $val 'HOST'
-                }
+                if ($red -eq $val -and -not (Test-IsRedactToken $val)) { $red = Get-RedactToken $val 'HOST' }
                 return ($m.Groups[1].Value + '=' + $red)
             })
         $str = Apply-Redaction $str
@@ -349,36 +323,119 @@ function E-CertDn {
 }
 
 function Dash {
-    # Encode a value; show an em-dash placeholder when empty.
     param([object]$s)
-    if ($null -eq $s) { return '<span class="muted">&mdash;</span>' }
-    $str = [string]$s
-    if ([string]::IsNullOrWhiteSpace($str)) { return '<span class="muted">&mdash;</span>' }
-    return (E $str)
+    if ($null -eq $s -or [string]::IsNullOrWhiteSpace([string]$s)) { return '<span class="muted">&mdash;</span>' }
+    return (E $s)
 }
 
 function DashMono {
-    # Encode a technical value (IP, MAC, CIDR, port, device) in monospace.
     param([object]$s)
-    if ($null -eq $s) { return '<span class="muted">&mdash;</span>' }
-    $str = [string]$s
-    if ([string]::IsNullOrWhiteSpace($str)) { return '<span class="muted">&mdash;</span>' }
-    return '<code class="mono">' + (E $str) + '</code>'
+    if ($null -eq $s -or [string]::IsNullOrWhiteSpace([string]$s)) { return '<span class="muted">&mdash;</span>' }
+    return '<code class="mono">' + (E $s) + '</code>'
+}
+
+function Badge {
+    param([string]$Text, [string]$Kind = 'muted', [bool]$Raw = $false)
+    $body = if ($Raw) { $Text } else { E $Text }
+    return '<span class="badge badge-' + $Kind + '">' + $body + '</span>'
+}
+
+function YesNo {
+    param([bool]$b)
+    if ($b) { return (Badge 'Yes' 'ok' $true) }
+    return (Badge 'No' 'muted' $true)
 }
 
 function Secret {
-    # PSKs / SNMP communities: click-to-reveal masked on screen when not redacted,
-    # completely replaced with [REDACTED] under -Redact.
     param([object]$s)
-    if ($null -eq $s) { return '<span class="muted">&mdash;</span>' }
-    $str = [string]$s
-    if ([string]::IsNullOrWhiteSpace($str)) { return '<span class="muted">&mdash;</span>' }
+    if ($null -eq $s -or [string]::IsNullOrWhiteSpace([string]$s)) { return '<span class="muted">&mdash;</span>' }
     if ($script:IsRedacted) { return '<span class="redacted">[REDACTED]</span>' }
     $script:HasPlaintextSecret = $true
     return '<span class="secret-wrap"><code class="mono secret-val is-masked">' +
-           [System.Net.WebUtility]::HtmlEncode($str) +
+           [System.Net.WebUtility]::HtmlEncode([string]$s) +
            '</code><button type="button" class="secret-btn" aria-label="Toggle secret visibility">Show</button></span>'
 }
+
+function Format-ListCell {
+    param(
+        [object[]]$Items,
+        [ValidateSet('text', 'mono', 'host', 'user')]
+        [string]$Mode = 'text',
+        [string]$Separator = '<br>'
+    )
+    $arr = @($Items | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_) })
+    if ($arr.Count -eq 0) { return '<span class="muted">&mdash;</span>' }
+    $formatted = @(foreach ($item in $arr) {
+        switch ($Mode) {
+            'mono' { DashMono $item }
+            'host' { E-Host $item }
+            'user' { E-User $item }
+            default { E $item }
+        }
+    })
+    return ($formatted -join $Separator)
+}
+
+function Add-Row {
+    param(
+        [System.Text.StringBuilder]$Sb,
+        [string[]]$Cells,
+        [string]$Id = '',
+        [string]$Class = '',
+        [bool]$Disabled = $false,
+        [string]$ExtraAttr = ''
+    )
+    [void]$Sb.Append('<tr')
+    if ($Id) { [void]$Sb.Append(' id="').Append($Id).Append('"') }
+    $cls = if ($Class) { $Class } elseif ($Disabled) { 'row-disabled' } else { '' }
+    if ($cls) { [void]$Sb.Append(' class="').Append($cls).Append('"') }
+    if ($Disabled) { [void]$Sb.Append(' data-disabled="1"') }
+    if ($ExtraAttr) { [void]$Sb.Append(' ').Append($ExtraAttr) }
+    [void]$Sb.Append('>')
+    foreach ($c in $Cells) {
+        if ($c.StartsWith('<td')) { [void]$Sb.Append($c) }
+        else { [void]$Sb.Append('<td>').Append($c).Append('</td>') }
+    }
+    [void]$Sb.Append('</tr>')
+}
+
+function Format-KvTable {
+    param([object[]]$Rows)
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('<div class="table-wrap"><table class="kv">')
+    foreach ($r in $Rows) {
+        $idAttr = if ($r.Count -ge 3 -and $r[2]) { ' id="' + $r[2] + '"' } else { '' }
+        [void]$sb.Append('<tr').Append($idAttr).Append('><th>').Append($r[0]).Append('</th><td>').Append($r[1]).Append('</td></tr>')
+    }
+    [void]$sb.Append('</table></div>')
+    return $sb.ToString()
+}
+
+function Tbl {
+    param([string[]]$headers, [string]$bodyHtml, [string]$tableClass = '')
+    $sb = New-Object System.Text.StringBuilder
+    $cls = if ($tableClass) { ' class="' + $tableClass + '"' } else { '' }
+    [void]$sb.Append('<div class="table-wrap"><table').Append($cls).Append('><thead><tr>')
+    foreach ($x in $headers) { [void]$sb.Append('<th>').Append($x).Append('</th>') }
+    [void]$sb.Append('</tr></thead><tbody>').Append($bodyHtml).Append('</tbody></table></div>')
+    return $sb.ToString()
+}
+
+function Wrap-Section {
+    param([string]$id, [string]$title, [string]$summary, [string]$body, [string]$headerBadge = '')
+    $isEmpty = [string]::IsNullOrWhiteSpace($body)
+    $b = if ($isEmpty) { '<p class="not-configured">Not configured.</p>' } else { $body }
+    $secCls = if ($isEmpty) { 'report-section section-empty' } else { 'report-section' }
+    return '<section class="' + $secCls + '" id="' + $id + '">' +
+           '<h2 class="section-heading"><button type="button" class="section-header" aria-expanded="true">' +
+           '<span class="toggle-icon" aria-hidden="true">&#9662;</span>' +
+           '<span class="sh-title">' + $title + '</span>' + $headerBadge + '</button></h2>' +
+           '<div class="section-body"><p class="section-summary">' + $summary + '</p>' + $b + '</div></section>'
+}
+
+# ==================================================================================
+#  XML, NETWORK, CRYPTO, CERT & CROSS-REFERENCE HELPERS
+# ==================================================================================
 
 function XText {
     param($node, [string]$path)
@@ -395,42 +452,33 @@ function XHas {
 }
 
 function XNodes {
-    # Always returns a real array (never collapses to a scalar). Windows PowerShell 5.1
-    # unwraps single-element collections returned from functions, and .Count on the
-    # resulting scalar throws under StrictMode or returns $null. The ',$arr' return
-    # guarantees array semantics on both 5.1 and 7.
+    # Always returns a real array (never collapses to a scalar on Windows PowerShell 5.1).
     param($node, [string]$path)
     $list = New-Object 'System.Collections.Generic.List[object]'
     if ($null -ne $node) {
         $r = $node.SelectNodes($path)
-        if ($null -ne $r) {
-            foreach ($n in $r) { [void]$list.Add($n) }
-        }
+        if ($null -ne $r) { foreach ($n in $r) { [void]$list.Add($n) } }
     }
     $arr = $list.ToArray()
     return , $arr
 }
 
-function YesNo {
-    param([bool]$b)
-    if ($b) { return '<span class="badge badge-ok">Yes</span>' }
-    return '<span class="badge badge-muted">No</span>'
+function Test-XmlEnabled {
+    param($node, [string[]]$TagNames = @('enable'))
+    if ($null -eq $node) { return $false }
+    foreach ($tag in $TagNames) {
+        if (XHas $node $tag) {
+            $v = XText $node $tag
+            if ($v -eq '' -or $v -match '(?i)^(enabled|on|yes|true|1)$') { return $true }
+        }
+    }
+    return $false
 }
 
 function Add-Finding {
-    param(
-        [string]$Sev,
-        [string]$Label,
-        [string]$Where,
-        [string]$Detail,
-        [string]$TargetId = ''
-    )
+    param([string]$Sev, [string]$Label, [string]$Where, [string]$Detail, [string]$TargetId = '')
     [void]$script:Findings.Add([pscustomobject]@{
-        Sev      = $Sev
-        Label    = $Label
-        Where    = $Where
-        Detail   = $Detail
-        TargetId = $TargetId
+        Sev = $Sev; Label = $Label; Where = $Where; Detail = $Detail; TargetId = $TargetId
     })
 }
 
@@ -439,13 +487,8 @@ function ConvertFrom-Epoch {
     if ([string]::IsNullOrWhiteSpace($s)) { return '' }
     $n = [int64]0
     if ([int64]::TryParse($s, [ref]$n)) {
-        try {
-            return ([DateTimeOffset]::FromUnixTimeSeconds($n)).ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss zzz')
-        }
-        catch {
-            Write-Verbose ("Could not parse Unix timestamp '{0}': {1}" -f $s, $_.Exception.Message)
-            return $s
-        }
+        try { return ([DateTimeOffset]::FromUnixTimeSeconds($n)).ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss zzz') }
+        catch { Write-Verbose ("Could not parse Unix timestamp '{0}': {1}" -f $s, $_.Exception.Message); return $s }
     }
     return $s
 }
@@ -453,14 +496,11 @@ function ConvertFrom-Epoch {
 function Get-Ipv4Mask {
     param([string]$bits)
     $b = 0
-    if (-not [int]::TryParse($bits, [ref]$b)) { return '' }
-    if ($b -lt 0 -or $b -gt 32) { return '' }
+    if (-not [int]::TryParse($bits, [ref]$b) -or $b -lt 0 -or $b -gt 32) { return '' }
     $octets = @(0, 0, 0, 0)
     for ($i = 0; $i -lt 4; $i++) {
         $take = [math]::Min(8, [math]::Max(0, $b - ($i * 8)))
-        if ($take -le 0)     { $octets[$i] = 0 }
-        elseif ($take -ge 8) { $octets[$i] = 255 }
-        else                 { $octets[$i] = [int](256 - [math]::Pow(2, 8 - $take)) }
+        $octets[$i] = if ($take -le 0) { 0 } elseif ($take -ge 8) { 255 } else { [int](256 - [math]::Pow(2, 8 - $take)) }
     }
     return ($octets -join '.')
 }
@@ -469,15 +509,14 @@ function Test-IsPrivateIpv4 {
     param([string]$ip)
     if ([string]::IsNullOrWhiteSpace($ip)) { return $false }
     $ipObj = $null
-    if (-not [System.Net.IPAddress]::TryParse($ip.Trim(), [ref]$ipObj)) { return $false }
-    if ($ipObj.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) { return $false }
+    if (-not [System.Net.IPAddress]::TryParse($ip.Trim(), [ref]$ipObj) -or
+        $ipObj.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) { return $false }
     $b = $ipObj.GetAddressBytes()
-    if ($b[0] -eq 10) { return $true }
-    if ($b[0] -eq 172 -and $b[1] -ge 16 -and $b[1] -le 31) { return $true }
-    if ($b[0] -eq 192 -and $b[1] -eq 168) { return $true }
-    if ($b[0] -eq 100 -and $b[1] -ge 64 -and $b[1] -le 127) { return $true }
-    if ($b[0] -eq 169 -and $b[1] -eq 254) { return $true }
-    return $false
+    return ($b[0] -eq 10) -or
+           ($b[0] -eq 172 -and $b[1] -ge 16 -and $b[1] -le 31) -or
+           ($b[0] -eq 192 -and $b[1] -eq 168) -or
+           ($b[0] -eq 100 -and $b[1] -ge 64 -and $b[1] -le 127) -or
+           ($b[0] -eq 169 -and $b[1] -eq 254)
 }
 
 function Get-WeakCryptoHits {
@@ -517,30 +556,52 @@ function Get-WeakDhFinding {
     return $null
 }
 
+function Add-CryptoFindings {
+    param(
+        [string[]]$CryptoValues,
+        [string[]]$DhGroups = @(),
+        [bool]$IsPfs = $false,
+        [string]$Where,
+        [string]$RowId,
+        [System.Text.StringBuilder]$Flags
+    )
+    $rowCls = ''
+    $weak = Get-WeakCryptoHits $CryptoValues
+    if ($weak.High.Count -gt 0) {
+        [void]$Flags.Append((Badge 'WEAK CRYPTO' 'high' $true)).Append(' ')
+        $rowCls = 'row-high'
+        Add-Finding 'high' 'WEAK CRYPTO' $Where ('Uses ' + ($weak.High -join ', ')) $RowId
+    }
+    if ($weak.Warn.Count -gt 0) {
+        [void]$Flags.Append((Badge 'LEGACY CRYPTO' 'warn' $true)).Append(' ')
+        if (-not $rowCls) { $rowCls = 'row-warn' }
+        Add-Finding 'warn' 'LEGACY CRYPTO' $Where ('Uses ' + ($weak.Warn -join ', ')) $RowId
+    }
+    foreach ($dhg in @($DhGroups | Where-Object { $_ } | Select-Object -Unique)) {
+        $dhf = Get-WeakDhFinding $dhg $IsPfs
+        if ($null -ne $dhf) {
+            $kind = if ($dhf.Sev -eq 'high') { 'high' } else { 'warn' }
+            [void]$Flags.Append((Badge $dhf.Label $kind)).Append(' ')
+            if ($dhf.Sev -eq 'high') { $rowCls = 'row-high' } elseif (-not $rowCls) { $rowCls = 'row-warn' }
+            Add-Finding $dhf.Sev $dhf.Label $Where $dhf.Detail $RowId
+        }
+    }
+    return $rowCls
+}
+
 function Get-CertInfo {
     param([string]$CrtField)
     $r = [pscustomobject]@{
-        Subject    = ''
-        Issuer     = ''
-        NotBefore  = $null
-        NotAfter   = $null
-        SigAlg     = ''
-        KeyAlg     = ''
-        KeySize    = 0
-        SelfSigned = $false
-        Error      = $null
+        Subject = ''; Issuer = ''; NotBefore = $null; NotAfter = $null
+        SigAlg = ''; KeyAlg = ''; KeySize = 0; SelfSigned = $false; Error = $null
     }
     if ([string]::IsNullOrWhiteSpace($CrtField)) { $r.Error = 'No certificate data'; return $r }
     $cert = $null
     try {
         $pem = $CrtField.Trim()
         if ($pem -notmatch 'BEGIN CERTIFICATE') {
-            try {
-                $pem = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(($CrtField -replace '\s', '')))
-            }
-            catch {
-                Write-Verbose ("Outer base64 decode failed for certificate: {0}" -f $_.Exception.Message)
-            }
+            try { $pem = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(($CrtField -replace '\s', ''))) }
+            catch { Write-Verbose ("Outer base64 decode failed: {0}" -f $_.Exception.Message) }
         }
         if ($pem -notmatch 'BEGIN CERTIFICATE') { $r.Error = 'Unrecognized certificate format'; return $r }
         $m = [regex]::Match($pem, '-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----', [System.Text.RegularExpressions.RegexOptions]::Singleline)
@@ -569,137 +630,86 @@ function Get-CertInfo {
                 }
             }
         }
-        catch {
-            Write-Verbose ("Could not inspect certificate public key: {0}" -f $_.Exception.Message)
-        }
+        catch { Write-Verbose ("Could not inspect certificate public key: {0}" -f $_.Exception.Message) }
     }
-    catch {
-        $r.Error = $_.Exception.Message
-    }
-    finally {
-        if ($null -ne $cert) { $cert.Dispose() }
-    }
+    catch { $r.Error = $_.Exception.Message }
+    finally { if ($null -ne $cert) { $cert.Dispose() } }
     return $r
 }
 
 function Format-CertStatus {
-    # Returns an HTML badge describing certificate validity, and records findings.
     param($info, [string]$where, [string]$targetId = '')
-    if ($info.Error) { return '<span class="badge badge-info">PARSE ERROR</span>' }
+    if ($info.Error) { return (Badge 'PARSE ERROR' 'info' $true) }
     $badges = New-Object System.Text.StringBuilder
     if ($null -ne $info.NotBefore -and $info.NotBefore -gt $script:Now) {
         Add-Finding 'warn' 'NOT YET VALID' $where ("Certificate is not valid until " + $info.NotBefore.ToString('yyyy-MM-dd')) $targetId
-        [void]$badges.Append('<span class="badge badge-warn">NOT YET VALID</span> ')
+        [void]$badges.Append((Badge 'NOT YET VALID' 'warn' $true)).Append(' ')
     }
     if ($null -eq $info.NotAfter) {
-        [void]$badges.Append('<span class="badge badge-muted">Unknown</span>')
+        [void]$badges.Append((Badge 'Unknown' 'muted' $true))
     }
     else {
         $days = ($info.NotAfter - $script:Now).TotalDays
         if ($days -lt 0) {
             Add-Finding 'high' 'EXPIRED' $where ("Certificate expired " + $info.NotAfter.ToString('yyyy-MM-dd')) $targetId
-            [void]$badges.Append('<span class="badge badge-high">EXPIRED</span>')
+            [void]$badges.Append((Badge 'EXPIRED' 'high' $true))
         }
         elseif ($days -lt $script:ExpiryWarnDays) {
             Add-Finding 'warn' 'EXPIRING SOON' $where ("Certificate expires " + $info.NotAfter.ToString('yyyy-MM-dd') + " (" + [int]$days + " days)") $targetId
-            [void]$badges.Append('<span class="badge badge-warn">EXPIRING SOON</span>')
+            [void]$badges.Append((Badge 'EXPIRING SOON' 'warn' $true))
         }
         elseif ($badges.Length -eq 0) {
-            [void]$badges.Append('<span class="badge badge-ok">Valid</span>')
+            [void]$badges.Append((Badge 'Valid' 'ok' $true))
         }
     }
-    # Check signature algorithm and RSA key length
     if ($info.SigAlg -match '(?i)md5') {
         Add-Finding 'high' 'WEAK CERT' $where ("Certificate uses weak signature algorithm: " + $info.SigAlg) $targetId
-        [void]$badges.Append(' <span class="badge badge-high">MD5 SIG</span>')
+        [void]$badges.Append(' ').Append((Badge 'MD5 SIG' 'high' $true))
     }
     elseif ($info.SigAlg -match '(?i)sha1') {
         Add-Finding 'warn' 'WEAK CERT' $where ("Certificate uses deprecated SHA-1 signature algorithm: " + $info.SigAlg) $targetId
-        [void]$badges.Append(' <span class="badge badge-warn">SHA-1 SIG</span>')
+        [void]$badges.Append(' ').Append((Badge 'SHA-1 SIG' 'warn' $true))
     }
     if ($info.KeyAlg -eq 'RSA' -and $info.KeySize -gt 0 -and $info.KeySize -lt 2048) {
         Add-Finding 'high' 'WEAK CERT' $where ("Certificate uses short RSA key (" + $info.KeySize + "-bit; <2048-bit).") $targetId
-        [void]$badges.Append(' <span class="badge badge-high">WEAK KEY</span>')
+        [void]$badges.Append(' ').Append((Badge 'WEAK KEY' 'high' $true))
     }
     return $badges.ToString().Trim()
 }
 
-function Tbl {
-    param([string[]]$headers, [string]$bodyHtml, [string]$tableClass = '')
-    $sb = New-Object System.Text.StringBuilder
-    $cls = if ($tableClass) { ' class="' + $tableClass + '"' } else { '' }
-    [void]$sb.Append('<div class="table-wrap"><table' + $cls + '><thead><tr>')
-    foreach ($x in $headers) {
-        [void]$sb.Append('<th>').Append($x).Append('</th>')
-    }
-    [void]$sb.Append('</tr></thead><tbody>').Append($bodyHtml).Append('</tbody></table></div>')
-    return $sb.ToString()
-}
-
-function Wrap-Section {
-    param(
-        [string]$id,
-        [string]$title,
-        [string]$summary,
-        [string]$body,
-        [string]$headerBadge = ''
-    )
-    $isEmpty = [string]::IsNullOrWhiteSpace($body)
-    $b = if ($isEmpty) { '<p class="not-configured">Not configured.</p>' } else { $body }
-    $secCls = if ($isEmpty) { 'report-section section-empty' } else { 'report-section' }
-    $sb = New-Object System.Text.StringBuilder
-    [void]$sb.Append('<section class="' + $secCls + '" id="' + $id + '">')
-    [void]$sb.Append('<h2 class="section-heading"><button type="button" class="section-header" aria-expanded="true">')
-    [void]$sb.Append('<span class="toggle-icon" aria-hidden="true">&#9662;</span>')
-    [void]$sb.Append('<span class="sh-title">' + $title + '</span>' + $headerBadge + '</button></h2>')
-    [void]$sb.Append('<div class="section-body"><p class="section-summary">' + $summary + '</p>' + $b + '</div></section>')
-    return $sb.ToString()
-}
-
 function Format-Endpoint {
-    # Returns a small object describing a firewall/NAT source or destination node.
     param($epNode)
     $o = [pscustomobject]@{ Addr = 'any'; Port = ''; Negated = $false; RawAddr = 'any' }
     if ($null -eq $epNode) { return $o }
     $neg = ''
     if (XHas $epNode 'not') { $neg = '! '; $o.Negated = $true }
-    $raw = 'any'
-    if (XHas $epNode 'any')           { $raw = 'any' }
-    elseif (XText $epNode 'network') { $raw = (XText $epNode 'network') }
-    elseif (XText $epNode 'address') { $raw = (XText $epNode 'address') }
+    $raw = if (XHas $epNode 'any') { 'any' } elseif (XText $epNode 'network') { XText $epNode 'network' } elseif (XText $epNode 'address') { XText $epNode 'address' } else { 'any' }
     $o.RawAddr = $raw
-    $o.Addr = $neg + $raw
-    $o.Port = (XText $epNode 'port')
+    $o.Addr    = $neg + $raw
+    $o.Port    = XText $epNode 'port'
     return $o
 }
 
 function Format-RefCell {
-    # Format an address/port token with optional Alias cross-link & preview tooltip or friendly interface label.
     param([string]$val, [bool]$negated = $false)
     if ([string]::IsNullOrWhiteSpace($val)) { return '<span class="muted">&mdash;</span>' }
     $clean = $val
     $prefix = ''
-    if ($negated -and $clean.StartsWith('! ')) {
-        $prefix = '<span class="badge badge-warn">!</span> '
+    if ($clean.StartsWith('! ')) {
+        $prefix = (Badge '!' 'warn' $true) + ' '
         $clean = $clean.Substring(2)
     }
-    elseif ($clean.StartsWith('! ')) {
-        $prefix = '<span class="badge badge-warn">!</span> '
-        $clean = $clean.Substring(2)
+    elseif ($negated) {
+        $prefix = (Badge '!' 'warn' $true) + ' '
     }
     if ($script:AliasMap.ContainsKey($clean)) {
         $alInfo = $script:AliasMap[$clean]
         $tip = if ($alInfo.Preview) { ' title="' + (E $alInfo.Preview) + '"' } else { '' }
         return $prefix + '<a class="xref alias-ref" href="#' + $alInfo.Id + '"' + $tip + '><code class="mono">' + (E $clean) + '</code></a>'
     }
-    if ($clean -eq '(self)') {
-        return $prefix + '<code class="mono">This Firewall (self)</code>'
-    }
-    if ($clean -match '^(.+)ip$') {
-        $ifKey = $Matches[1]
-        if ($script:IfMap.ContainsKey($ifKey)) {
-            return $prefix + '<code class="mono">' + (E $clean) + '</code> <span class="muted">(' + (E $script:IfMap[$ifKey]) + ' addr)</span>'
-        }
+    if ($clean -eq '(self)') { return $prefix + '<code class="mono">This Firewall (self)</code>' }
+    if ($clean -match '^(.+)ip$' -and $script:IfMap.ContainsKey($Matches[1])) {
+        return $prefix + '<code class="mono">' + (E $clean) + '</code> <span class="muted">(' + (E $script:IfMap[$Matches[1]]) + ' addr)</span>'
     }
     if ($script:IfMap.ContainsKey($clean)) {
         return $prefix + '<code class="mono">' + (E $clean) + '</code> <span class="muted">(' + (E $script:IfMap[$clean]) + ' net)</span>'
@@ -731,36 +741,20 @@ function Get-LogoTag {
     param([string]$path)
     if ([string]::IsNullOrWhiteSpace($path)) { return '' }
     $full = Resolve-FullPath $path
-    if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
-        Write-Warning "Logo not found: $path"
-        return ''
-    }
+    if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { Write-Warning "Logo not found: $path"; return '' }
     try {
+        $mimeMap = @{ '.png'='image/png'; '.jpg'='image/jpeg'; '.jpeg'='image/jpeg'; '.gif'='image/gif'; '.svg'='image/svg+xml'; '.webp'='image/webp' }
         $ext = ([System.IO.Path]::GetExtension($full)).ToLowerInvariant()
-        switch ($ext) {
-            '.png'  { $mime = 'image/png' }
-            '.jpg'  { $mime = 'image/jpeg' }
-            '.jpeg' { $mime = 'image/jpeg' }
-            '.gif'  { $mime = 'image/gif' }
-            '.svg'  { $mime = 'image/svg+xml' }
-            '.webp' { $mime = 'image/webp' }
-            default {
-                Write-Warning "Unsupported logo format '$ext' (expected png/jpg/gif/svg/webp). Skipping logo."
-                return ''
-            }
+        if (-not $mimeMap.ContainsKey($ext)) {
+            Write-Warning "Unsupported logo format '$ext' (expected png/jpg/gif/svg/webp). Skipping logo."
+            return ''
         }
         $fi = Get-Item -LiteralPath $full
-        if ($fi.Length -gt 2MB) {
-            Write-Warning ("Logo file is large ({0:N1} MB); embedding as base64 will increase report size." -f ($fi.Length / 1MB))
-        }
-        $bytes = [System.IO.File]::ReadAllBytes($full)
-        $b64   = [Convert]::ToBase64String($bytes)
-        return '<img class="cover-logo" alt="Logo" src="data:' + $mime + ';base64,' + $b64 + '" />'
+        if ($fi.Length -gt 2MB) { Write-Warning ("Logo file is large ({0:N1} MB)." -f ($fi.Length / 1MB)) }
+        $b64 = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($full))
+        return '<img class="cover-logo" alt="Logo" src="data:' + $mimeMap[$ext] + ';base64,' + $b64 + '" />'
     }
-    catch {
-        Write-Warning "Could not embed logo: $($_.Exception.Message)"
-        return ''
-    }
+    catch { Write-Warning "Could not embed logo: $($_.Exception.Message)"; return '' }
 }
 
 function Build-RefUsageMap {
@@ -772,25 +766,19 @@ function Build-RefUsageMap {
     $stack.Push($root)
     while ($stack.Count -gt 0) {
         $n = $stack.Pop()
+        $hasElementChild = $false
         foreach ($child in $n.ChildNodes) {
             if ($child.NodeType -eq [System.Xml.XmlNodeType]::Element) {
+                $hasElementChild = $true
                 $stack.Push($child)
             }
         }
-        $name = $n.LocalName
-        if ($name -eq 'refid') { continue }
-        # Only leaf text elements that look like reference pointers
-        $hasElementChild = $false
-        foreach ($child in $n.ChildNodes) {
-            if ($child.NodeType -eq [System.Xml.XmlNodeType]::Element) { $hasElementChild = $true; break }
-        }
-        if ($hasElementChild) { continue }
+        if ($hasElementChild -or $n.LocalName -eq 'refid') { continue }
         $val = ([string]$n.InnerText).Trim()
-        if ([string]::IsNullOrWhiteSpace($val)) { continue }
-        if (-not $script:CertRefMap.ContainsKey($val)) { continue }
+        if ([string]::IsNullOrWhiteSpace($val) -or -not $script:CertRefMap.ContainsKey($val)) { continue }
 
         $parent = if ($null -ne $n.ParentNode) { $n.ParentNode.LocalName } else { '' }
-        $label = switch -regex ("$parent/$name") {
+        $label = switch -regex ("$parent/$($n.LocalName)") {
             '^webgui/ssl-certref$'     { 'WebGUI HTTPS certificate'; break }
             '^openvpn-server/certref$' { 'OpenVPN server certificate'; break }
             '^openvpn-server/caref$'   { 'OpenVPN server CA'; break }
@@ -804,14 +792,10 @@ function Build-RefUsageMap {
             '^user/cert$'              { 'User certificate'; break }
             '^syslog/.*certref$'       { 'Remote Syslog TLS'; break }
             'captiveportal'            { 'Captive Portal HTTPS'; break }
-            default                    { "$parent ($name)" }
+            default                    { "$parent ($($n.LocalName))" }
         }
-        if (-not $map.ContainsKey($val)) {
-            $map[$val] = New-Object 'System.Collections.Generic.List[string]'
-        }
-        if (-not $map[$val].Contains($label)) {
-            [void]$map[$val].Add($label)
-        }
+        if (-not $map.ContainsKey($val)) { $map[$val] = New-Object 'System.Collections.Generic.List[string]' }
+        if (-not $map[$val].Contains($label)) { [void]$map[$val].Add($label) }
     }
     return $map
 }
@@ -819,7 +803,6 @@ function Build-RefUsageMap {
 function Build-LookupMaps {
     param($root, [string[]]$ForceWan, [string[]]$ForceInternal)
 
-    # Interfaces friendly names
     $ifsNode = $root.SelectSingleNode('interfaces')
     if ($null -ne $ifsNode) {
         foreach ($c in $ifsNode.ChildNodes) {
@@ -829,45 +812,28 @@ function Build-LookupMaps {
             }
         }
     }
-    # Interface groups
     foreach ($ig in (XNodes $root 'ifgroups/ifgroupentry')) {
         $gn = XText $ig 'ifname'
-        if ($gn) {
-            $gd = XText $ig 'descr'
-            $script:IfMap[$gn] = if ($gd) { "Group: $gd" } else { "Interface Group ($gn)" }
-        }
+        if ($gn) { $gd = XText $ig 'descr'; $script:IfMap[$gn] = if ($gd) { "Group: $gd" } else { "Interface Group ($gn)" } }
     }
-    # WireGuard pseudo-interface
-    $script:IfMap['WireGuard']  = 'WireGuard'
-    $script:IfMap['openvpn']    = 'OpenVPN'
-    $script:IfMap['enc0']       = 'IPsec'
-    $script:IfMap['ipsec']      = 'IPsec'
-    $script:IfMap['l2tp']       = 'L2TP'
-    $script:IfMap['(floating)'] = 'Floating rules'
+    foreach ($kv in @{ WireGuard='WireGuard'; openvpn='OpenVPN'; enc0='IPsec'; ipsec='IPsec'; l2tp='L2TP'; '(floating)'='Floating rules' }.GetEnumerator()) {
+        $script:IfMap[$kv.Key] = $kv.Value
+    }
 
-    # Gateways map + default gateway identification
+    # Gateways & default gateway identification
     $gwNode = $root.SelectSingleNode('gateways')
     $defaultGws = @{}
     if ($null -ne $gwNode) {
-        $d4 = XText $gwNode 'defaultgw4'
-        $d6 = XText $gwNode 'defaultgw6'
-        if ($d4 -and $d4 -ne 'automatic' -and $d4 -ne '-') { $defaultGws[$d4] = $true }
-        if ($d6 -and $d6 -ne 'automatic' -and $d6 -ne '-') { $defaultGws[$d6] = $true }
+        foreach ($d in @((XText $gwNode 'defaultgw4'), (XText $gwNode 'defaultgw6'))) {
+            if ($d -and $d -ne 'automatic' -and $d -ne '-') { $defaultGws[$d] = $true }
+        }
     }
     $wanGwIfaces = @{}
-    $allGwIfaces = @{}
     foreach ($g in (XNodes $root 'gateways/gateway_item')) {
-        $gname = XText $g 'name'
-        $gi    = XText $g 'interface'
-        $gip   = XText $g 'gateway'
+        $gname = XText $g 'name'; $gi = XText $g 'interface'; $gip = XText $g 'gateway'
         if ($gname) { $script:GatewayMap[$gname] = 'gw-' + (Format-Slug $gname) }
-        if ($gi) {
-            $allGwIfaces[$gi] = $true
-            $isDefaultGw = ($gname -and $defaultGws.ContainsKey($gname))
-            $isPublicGw  = ($gip -and $gip -ne 'dynamic' -and -not (Test-IsPrivateIpv4 $gip))
-            if ($isDefaultGw -or $isPublicGw -or $gip -eq 'dynamic') {
-                $wanGwIfaces[$gi] = $true
-            }
+        if ($gi -and (($gname -and $defaultGws.ContainsKey($gname)) -or $gip -eq 'dynamic' -or ($gip -and -not (Test-IsPrivateIpv4 $gip)))) {
+            $wanGwIfaces[$gi] = $true
         }
     }
     foreach ($gg in (XNodes $root 'gateways/gateway_group')) {
@@ -875,95 +841,49 @@ function Build-LookupMaps {
         if ($ggname) { $script:GatewayMap[$ggname] = 'gwg-' + (Format-Slug $ggname) }
     }
 
-    $forceWanSet = @{}
-    if ($null -ne $ForceWan) { foreach ($x in $ForceWan) { if ($x) { $forceWanSet[$x.Trim().ToLowerInvariant()] = $true } } }
-    $forceIntSet = @{}
-    if ($null -ne $ForceInternal) { foreach ($x in $ForceInternal) { if ($x) { $forceIntSet[$x.Trim().ToLowerInvariant()] = $true } } }
+    $forceWanSet = @{}; if ($null -ne $ForceWan)      { foreach ($x in $ForceWan)      { if ($x) { $forceWanSet[$x.Trim().ToLowerInvariant()] = $true } } }
+    $forceIntSet = @{}; if ($null -ne $ForceInternal) { foreach ($x in $ForceInternal) { if ($x) { $forceIntSet[$x.Trim().ToLowerInvariant()] = $true } } }
 
-    # Interface trust classification
     if ($null -ne $ifsNode) {
         foreach ($c in $ifsNode.ChildNodes) {
             if ($c.NodeType -ne [System.Xml.XmlNodeType]::Element) { continue }
-            $k = $c.Name
-            $kl = $k.ToLowerInvariant()
+            $k = $c.Name; $kl = $k.ToLowerInvariant()
             if ($forceIntSet.ContainsKey($kl)) { $script:TrustMap[$k] = 'internal'; continue }
             if ($forceWanSet.ContainsKey($kl)) { $script:TrustMap[$k] = 'wan'; continue }
-
-            $dev  = XText $c 'if'
-            $dscr = XText $c 'descr'
+            $dev = XText $c 'if'; $dscr = XText $c 'descr'
             if ($dev -match '^(tun_wg|wg|ovpn|ipsec|enc)\d*' -or $dscr -match '(?i)\b(wireguard|wg|vpn|openvpn|ipsec)\b') {
-                $script:TrustMap[$k] = 'vpn'
-                continue
+                $script:TrustMap[$k] = 'vpn'; continue
             }
-
-            $isWan = $false
-            if ($kl -eq 'wan') { $isWan = $true }
-            if ($wanGwIfaces.ContainsKey($k)) { $isWan = $true }
             $gwv = XText $c 'gateway'
-            if ($gwv -and $gwv -ne 'none' -and ($defaultGws.ContainsKey($gwv) -or $wanGwIfaces.ContainsKey($k) -or $kl -ne 'lan')) {
-                $isWan = $true
-            }
             $ipv = (XText $c 'ipaddr').ToLowerInvariant()
-            if ($ipv -in @('dhcp', 'pppoe', 'pptp', 'l2tp')) { $isWan = $true }
-            if ($kl -match 'wan' -or $dscr -match '(?i)\b(wan|internet|isp|untrust|external)\b') { $isWan = $true }
+            $isWan = ($kl -eq 'wan') -or $wanGwIfaces.ContainsKey($k) -or
+                     ($gwv -and $gwv -ne 'none' -and ($defaultGws.ContainsKey($gwv) -or $kl -ne 'lan')) -or
+                     ($ipv -in @('dhcp', 'pppoe', 'pptp', 'l2tp')) -or
+                     ($kl -match 'wan' -or $dscr -match '(?i)\b(wan|internet|isp|untrust|external)\b')
             $script:TrustMap[$k] = if ($isWan) { 'wan' } else { 'internal' }
         }
     }
-    $script:TrustMap['openvpn']    = 'vpn'
-    $script:TrustMap['enc0']       = 'vpn'
-    $script:TrustMap['ipsec']      = 'vpn'
-    $script:TrustMap['l2tp']       = 'vpn'
-    $script:TrustMap['WireGuard']  = 'vpn'
+    foreach ($k in @('openvpn','enc0','ipsec','l2tp','WireGuard')) { $script:TrustMap[$k] = 'vpn' }
     $script:TrustMap['(floating)'] = 'floating'
 
-    # VLANs
     foreach ($v in (XNodes $root 'vlans/vlan')) {
         $vif = XText $v 'vlanif'
-        $tag = XText $v 'tag'
-        if ($vif) { $script:VlanMap[$vif] = [pscustomobject]@{ Tag = $tag; Id = 'vlan-' + (Format-Slug $vif) } }
+        if ($vif) { $script:VlanMap[$vif] = [pscustomobject]@{ Tag = XText $v 'tag'; Id = 'vlan-' + (Format-Slug $vif) } }
     }
-
-    # Aliases (for cross-links & hover previews)
     foreach ($a in (XNodes $root 'aliases/alias')) {
         $an = XText $a 'name'
-        if ($an) {
-            $addr = XText $a 'address'
-            if (-not $addr) { $addr = XText $a 'url' }
-            $items = @($addr -split '\s+' | Where-Object { $_ })
-            $preview = if ($items.Count -gt 6) {
-                (($items[0..5]) -join ', ') + " (+$($items.Count - 6) more)"
-            }
-            else {
-                $items -join ', '
-            }
-            $script:AliasMap[$an] = [pscustomobject]@{
-                Id      = 'alias-' + (Format-Slug $an)
-                Type    = XText $a 'type'
-                Preview = $preview
-            }
+        if (-not $an) { continue }
+        $addr = XText $a 'address'; if (-not $addr) { $addr = XText $a 'url' }
+        $items = @($addr -split '\s+' | Where-Object { $_ })
+        $preview = if ($items.Count -gt 6) { (($items[0..5]) -join ', ') + " (+$($items.Count - 6) more)" } else { $items -join ', ' }
+        $script:AliasMap[$an] = [pscustomobject]@{ Id = 'alias-' + (Format-Slug $an); Type = XText $a 'type'; Preview = $preview }
+    }
+    foreach ($pair in @(@('ca','ca-'), @('cert','cert-'))) {
+        foreach ($c in (XNodes $root $pair[0])) {
+            $rid = XText $c 'refid'
+            if ($rid) { $script:CertRefMap[$rid] = [pscustomobject]@{ Name = XText $c 'descr'; Id = $pair[1] + (Format-Slug $rid) } }
         }
     }
-
-    # Certs & CAs
-    foreach ($c in (XNodes $root 'ca')) {
-        $rid = XText $c 'refid'
-        if ($rid) {
-            $script:CertRefMap[$rid] = [pscustomobject]@{
-                Name = XText $c 'descr'
-                Id   = 'ca-' + (Format-Slug $rid)
-            }
-        }
-    }
-    foreach ($c in (XNodes $root 'cert')) {
-        $rid = XText $c 'refid'
-        if ($rid) {
-            $script:CertRefMap[$rid] = [pscustomobject]@{
-                Name = XText $c 'descr'
-                Id   = 'cert-' + (Format-Slug $rid)
-            }
-        }
-    }
-
     $script:RefUsageMap = Build-RefUsageMap $root
 }
 
@@ -976,49 +896,25 @@ function Build-System {
     $sys = $root.SelectSingleNode('system')
     if ($null -eq $sys) { return '' }
 
-    $dns = New-Object 'System.Collections.Generic.List[string]'
-    foreach ($d in (XNodes $sys 'dnsserver')) {
-        $dv = $d.InnerText.Trim()
-        if ($dv) { [void]$dns.Add($dv) }
-    }
+    $dns = @(foreach ($d in (XNodes $sys 'dnsserver')) { $d.InnerText.Trim() })
     $ntp = @((XText $sys 'timeservers') -split '\s+' | Where-Object { $_ })
-    $tz  = XText $sys 'timezone'
     $gui = $sys.SelectSingleNode('webgui')
-    $proto = XText $gui 'protocol'
-    if (-not $proto) { $proto = 'https' }
+    $proto = XText $gui 'protocol'; if (-not $proto) { $proto = 'https' }
     $port  = XText $gui 'port'
     $portDisp = if ($port) { $port } elseif ($proto -eq 'http') { '80 (default)' } else { '443 (default)' }
-    $guiCert = XText $gui 'ssl-certref'
+    $guiCert       = XText $gui 'ssl-certref'
     $noAntiLockout = XHas $gui 'noantilockout'
     $noDnsRebind   = XHas $gui 'nodnsrebindcheck'
     $noReferer     = XHas $gui 'nohttpreferercheck'
 
-    if ($proto -ieq 'http') {
-        Add-Finding 'high' 'INSECURE WEBGUI' 'System / WebGUI' 'WebGUI is configured to use unencrypted HTTP instead of HTTPS.' 'row-sys-webgui'
-    }
-    if ($noDnsRebind) {
-        Add-Finding 'warn' 'DNS REBIND OFF' 'System / WebGUI' 'DNS Rebind Attack protection is disabled.' 'row-sys-rebind'
-    }
-    if ($noReferer) {
-        Add-Finding 'warn' 'REFERER CHECK OFF' 'System / WebGUI' 'HTTP_REFERER enforcement check is disabled.' 'row-sys-referer'
-    }
+    if ($proto -ieq 'http') { Add-Finding 'high' 'INSECURE WEBGUI'   'System / WebGUI' 'WebGUI is configured to use unencrypted HTTP instead of HTTPS.' 'row-sys-webgui' }
+    if ($noDnsRebind)       { Add-Finding 'warn' 'DNS REBIND OFF'    'System / WebGUI' 'DNS Rebind Attack protection is disabled.' 'row-sys-rebind' }
+    if ($noReferer)         { Add-Finding 'warn' 'REFERER CHECK OFF' 'System / WebGUI' 'HTTP_REFERER enforcement check is disabled.' 'row-sys-referer' }
 
-    $sshNode = $sys.SelectSingleNode('ssh')
-    $sshEnabled = $false
-    $sshPort = ''
-    $sshKeyOnly = ''
-    if ($null -ne $sshNode) {
-        if (XHas $sshNode 'enable') {
-            $sv = XText $sshNode 'enable'
-            if ($sv -eq '' -or $sv -match '(?i)^(enabled|on|yes|true|1)$') { $sshEnabled = $true }
-        }
-        elseif (XHas $sshNode 'enabled') {
-            $sv = XText $sshNode 'enabled'
-            if ($sv -eq '' -or $sv -match '(?i)^(enabled|on|yes|true|1)$') { $sshEnabled = $true }
-        }
-        $sshPort = XText $sshNode 'port'
-        $sshKeyOnly = XText $sshNode 'sshdkeyonly'
-    }
+    $sshNode    = $sys.SelectSingleNode('ssh')
+    $sshEnabled = Test-XmlEnabled $sshNode @('enable', 'enabled')
+    $sshPort    = XText $sshNode 'port'
+    $sshKeyOnly = XText $sshNode 'sshdkeyonly'
     if ($sshEnabled -and ($sshKeyOnly -notin @('enabled', 'both'))) {
         Add-Finding 'warn' 'SSH PASSWORD AUTH' 'System / SSH' 'SSH is enabled and permits password authentication (Public Key Only is not enforced).' 'row-sys-ssh'
     }
@@ -1028,50 +924,37 @@ function Build-System {
         Add-Finding 'info' 'UNPROTECTED CONSOLE' 'System / Console' 'Console menu password protection is not enabled.' 'row-sys-console'
     }
 
-    $sb = New-Object System.Text.StringBuilder
-    [void]$sb.Append('<div class="table-wrap"><table class="kv">')
-    [void]$sb.Append('<tr><th>Hostname</th><td>' + (E-Host (XText $sys 'hostname')) + '</td></tr>')
-    [void]$sb.Append('<tr><th>Domain</th><td>' + (Dash (XText $sys 'domain')) + '</td></tr>')
-    if ($dns.Count -gt 0) {
-        [void]$sb.Append('<tr><th>DNS servers</th><td>' + (($dns | ForEach-Object { DashMono $_ }) -join '<br>') + '</td></tr>')
-    }
-    else {
-        [void]$sb.Append('<tr><th>DNS servers</th><td><span class="muted">&mdash;</span></td></tr>')
-    }
-    if ($ntp.Count -gt 0) {
-        [void]$sb.Append('<tr><th>NTP servers</th><td>' + (($ntp | ForEach-Object { DashMono $_ }) -join '<br>') + '</td></tr>')
-    }
-    else {
-        [void]$sb.Append('<tr><th>NTP servers</th><td><span class="muted">&mdash;</span></td></tr>')
-    }
-    [void]$sb.Append('<tr><th>Time zone</th><td>' + (Dash $tz) + '</td></tr>')
+    $guiHtml = '<code class="mono">' + (E $proto) + '</code> on port <code class="mono">' + (E $portDisp) + '</code>'
+    if ($guiCert) { $guiHtml += ' &mdash; Cert: ' + (Format-CertRef $guiCert) }
+    if ($proto -ieq 'http') { $guiHtml += ' ' + (Badge 'INSECURE HTTP' 'high' $true) }
 
-    $guiBadges = if ($proto -ieq 'http') { ' <span class="badge badge-high">INSECURE HTTP</span>' } else { '' }
-    $guiExtra = if ($guiCert) { ' &mdash; Cert: ' + (Format-CertRef $guiCert) } else { '' }
-    [void]$sb.Append('<tr id="row-sys-webgui"><th>WebGUI</th><td><code class="mono">' + (E $proto) + '</code> on port <code class="mono">' + (E $portDisp) + '</code>' + $guiExtra + $guiBadges + '</td></tr>')
-    [void]$sb.Append('<tr><th>WebGUI anti-lockout</th><td>' + (YesNo (-not $noAntiLockout)) + '</td></tr>')
-    [void]$sb.Append('<tr id="row-sys-rebind"><th>DNS rebind check</th><td>' + (YesNo (-not $noDnsRebind)) + '</td></tr>')
-    [void]$sb.Append('<tr id="row-sys-referer"><th>HTTP Referer check</th><td>' + (YesNo (-not $noReferer)) + '</td></tr>')
-
-    $sshInfo = YesNo $sshEnabled
+    $sshHtml = YesNo $sshEnabled
     if ($sshEnabled) {
         $sp = if ($sshPort) { $sshPort } else { '22 (default)' }
-        $sk = switch ($sshKeyOnly) {
-            'enabled' { 'Public key only' }
-            'both'    { 'Key + password' }
-            default   { 'Password or key' }
-        }
-        $sshInfo += ' &mdash; Port <code class="mono">' + (E $sp) + '</code> (' + (E $sk) + ')'
+        $sk = switch ($sshKeyOnly) { 'enabled' { 'Public key only' } 'both' { 'Key + password' } default { 'Password or key' } }
+        $sshHtml += ' &mdash; Port <code class="mono">' + (E $sp) + '</code> (' + (E $sk) + ')'
     }
-    [void]$sb.Append('<tr id="row-sys-ssh"><th>SSH access</th><td>' + $sshInfo + '</td></tr>')
-    [void]$sb.Append('<tr id="row-sys-console"><th>Console password protection</th><td>' + (YesNo $consoleProtected) + '</td></tr>')
-    [void]$sb.Append('<tr><th>Tuning / optimization</th><td>' + (Dash (XText $sys 'optimization')) + '</td></tr>')
+
+    $rows = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($r in @(
+        @('Hostname',                    (E-Host (XText $sys 'hostname'))),
+        @('Domain',                      (Dash (XText $sys 'domain'))),
+        @('DNS servers',                 (Format-ListCell $dns -Mode 'mono')),
+        @('NTP servers',                 (Format-ListCell $ntp -Mode 'mono')),
+        @('Time zone',                   (Dash (XText $sys 'timezone'))),
+        @('WebGUI',                      $guiHtml, 'row-sys-webgui'),
+        @('WebGUI anti-lockout',         (YesNo (-not $noAntiLockout))),
+        @('DNS rebind check',            (YesNo (-not $noDnsRebind)), 'row-sys-rebind'),
+        @('HTTP Referer check',          (YesNo (-not $noReferer)), 'row-sys-referer'),
+        @('SSH access',                  $sshHtml, 'row-sys-ssh'),
+        @('Console password protection', (YesNo $consoleProtected), 'row-sys-console'),
+        @('Tuning / optimization',       (Dash (XText $sys 'optimization')))
+    )) { [void]$rows.Add($r) }
     $crypto = XText $sys 'crypto_hardware'
-    if ($crypto) { [void]$sb.Append('<tr><th>Hardware crypto</th><td>' + (E $crypto) + '</td></tr>') }
+    if ($crypto) { [void]$rows.Add(@('Hardware crypto', (E $crypto))) }
     $dhcpBackend = XText $root 'dhcpbackend'
-    if ($dhcpBackend) { [void]$sb.Append('<tr><th>DHCP backend</th><td>' + (E $dhcpBackend.ToUpperInvariant()) + '</td></tr>') }
-    [void]$sb.Append('</table></div>')
-    return $sb.ToString()
+    if ($dhcpBackend) { [void]$rows.Add(@('DHCP backend', (E $dhcpBackend.ToUpperInvariant()))) }
+    return (Format-KvTable $rows.ToArray())
 }
 
 function Build-Interfaces {
@@ -1083,91 +966,48 @@ function Build-Interfaces {
     foreach ($c in $ifs.ChildNodes) {
         if ($c.NodeType -ne [System.Xml.XmlNodeType]::Element) { continue }
         $any = $true
-        $key   = $c.Name
-        $rowId = 'row-if-' + (Format-Slug $key)
-        $descr = XText $c 'descr'
-        $dev   = XText $c 'if'
-        $en    = XHas $c 'enable'
-        $ipv4  = XText $c 'ipaddr'
+        $key = $c.Name; $rowId = 'row-if-' + (Format-Slug $key)
+        $dev = XText $c 'if'; $en = XHas $c 'enable'; $ipv4 = XText $c 'ipaddr'
         $method = switch -regex ($ipv4) {
-            '^dhcp$'   { 'DHCP'; break }
-            '^pppoe$'  { 'PPPoE'; break }
-            '^pptp$'   { 'PPTP'; break }
-            '^l2tp$'   { 'L2TP'; break }
-            '^carp$'   { 'CARP'; break }
-            '^none$'   { 'None'; break }
-            '^\d+\.'   { 'Static'; break }
-            '^$'       { 'None'; break }
-            default    { $ipv4 }
+            '^dhcp$'  { 'DHCP'; break }  '^pppoe$' { 'PPPoE'; break } '^pptp$' { 'PPTP'; break }
+            '^l2tp$'  { 'L2TP'; break }  '^carp$'  { 'CARP'; break }  '^none$|^$' { 'None'; break }
+            '^\d+\.'  { 'Static'; break } default  { $ipv4 }
         }
         $ipv4disp = if ($ipv4 -match '^(dhcp|pppoe|pptp|l2tp|dhcp6|carp|none|)$') { '' } else { $ipv4 }
-        $subnet = XText $c 'subnet'
-        $mask   = Get-Ipv4Mask $subnet
-        $subnetDisp = ''
-        if ($ipv4disp -and $subnet) {
-            $subnetDisp = '/' + $subnet
-            if ($mask) { $subnetDisp += ' (' + $mask + ')' }
-        }
+        $subnet = XText $c 'subnet'; $mask = Get-Ipv4Mask $subnet
+        $subnetDisp = if ($ipv4disp -and $subnet) { '/' + $subnet + $(if ($mask) { ' (' + $mask + ')' } else { '' }) } else { '' }
 
-        $v6 = XText $c 'ipaddrv6'
-        $v6Static = $false
+        $v6 = XText $c 'ipaddrv6'; $v6Static = $false
         $v6disp = switch -regex ($v6) {
             '^track6$' {
-                $t6if = XText $c 'track6-interface'
-                $t6id = XText $c 'track6-prefix-id'
-                $lbl = if ($t6if) { 'Track IPv6 (' + $t6if.ToUpperInvariant() + $(if ($t6id -ne '') { ", prefix $t6id" } else { '' }) + ')' } else { 'Track IPv6' }
-                $lbl; break
+                $t6if = XText $c 'track6-interface'; $t6id = XText $c 'track6-prefix-id'
+                if ($t6if) { 'Track IPv6 (' + $t6if.ToUpperInvariant() + $(if ($t6id -ne '') { ", prefix $t6id" } else { '' }) + ')' } else { 'Track IPv6' }
+                break
             }
-            '^dhcp6$'  { 'DHCP6'; break }
-            '^slaac$'  { 'SLAAC'; break }
-            '^6rd$'    { '6rd Tunnel'; break }
-            '^6to4$'   { '6to4 Tunnel'; break }
-            '^none$'   { ''; break }
-            '^$'       { ''; break }
-            default    { $v6Static = $true; $v6 }
+            '^dhcp6$' { 'DHCP6'; break } '^slaac$' { 'SLAAC'; break } '^6rd$' { '6rd Tunnel'; break }
+            '^6to4$'  { '6to4 Tunnel'; break } '^none$|^$' { ''; break }
+            default   { $v6Static = $true; $v6 }
         }
-        $sv6 = XText $c 'subnetv6'
-        if ($v6Static -and $sv6) { $v6disp += '/' + $sv6 }
+        $sv6 = XText $c 'subnetv6'; if ($v6Static -and $sv6) { $v6disp += '/' + $sv6 }
 
-        $mac = XText $c 'spoofmac'
-        $mtu = XText $c 'mtu'
-        $mss = XText $c 'mss'
         $vlanCell = '<span class="muted">&mdash;</span>'
         if ($script:VlanMap.ContainsKey($dev)) {
             $vi = $script:VlanMap[$dev]
             $vlanCell = '<a class="xref" href="#' + $vi.Id + '"><code class="mono">' + (E $vi.Tag) + '</code></a>'
         }
-        elseif ($dev -match '\.(\d+)$') {
-            $vlanCell = '<code class="mono">' + (E $Matches[1]) + '</code>'
-        }
-        $gw   = XText $c 'gateway'
-        $brfc = XHas $c 'blockpriv'
+        elseif ($dev -match '\.(\d+)$') { $vlanCell = '<code class="mono">' + (E $Matches[1]) + '</code>' }
+
         $bbog = XHas $c 'blockbogons'
-
-        if ($en -and $script:TrustMap.ContainsKey($key) -and $script:TrustMap[$key] -eq 'wan') {
-            if (-not $bbog) {
-                Add-Finding 'info' 'BOGONS NOT BLOCKED' "Interface / $key" "WAN interface '$key' does not have 'Block bogon networks' enabled." $rowId
-            }
+        if ($en -and $script:TrustMap.ContainsKey($key) -and $script:TrustMap[$key] -eq 'wan' -and -not $bbog) {
+            Add-Finding 'info' 'BOGONS NOT BLOCKED' "Interface / $key" "WAN interface '$key' does not have 'Block bogon networks' enabled." $rowId
         }
 
-        $cls = if (-not $en) { ' class="row-disabled"' } else { '' }
-        [void]$sb.Append('<tr id="' + $rowId + '"' + $cls + '>')
-        [void]$sb.Append('<td><code class="mono">' + (E $key) + '</code></td>')
-        [void]$sb.Append('<td>' + (Dash $descr) + '</td>')
-        [void]$sb.Append('<td>' + (DashMono $dev) + '</td>')
-        [void]$sb.Append('<td>' + (YesNo $en) + '</td>')
-        [void]$sb.Append('<td>' + (Dash $method) + '</td>')
-        [void]$sb.Append('<td>' + (DashMono $ipv4disp) + '</td>')
-        [void]$sb.Append('<td>' + (DashMono $subnetDisp) + '</td>')
-        [void]$sb.Append('<td>' + (DashMono $v6disp) + '</td>')
-        [void]$sb.Append('<td>' + (DashMono $mac) + '</td>')
-        [void]$sb.Append('<td>' + (DashMono $mtu) + '</td>')
-        [void]$sb.Append('<td>' + (DashMono $mss) + '</td>')
-        [void]$sb.Append('<td>' + $vlanCell + '</td>')
-        [void]$sb.Append('<td>' + (Format-GatewayRef $gw) + '</td>')
-        [void]$sb.Append('<td>' + (YesNo $brfc) + '</td>')
-        [void]$sb.Append('<td>' + (YesNo $bbog) + '</td>')
-        [void]$sb.Append('</tr>')
+        Add-Row $sb -Id $rowId -Disabled (-not $en) -Cells @(
+            (DashMono $key), (Dash (XText $c 'descr')), (DashMono $dev), (YesNo $en),
+            (Dash $method), (DashMono $ipv4disp), (DashMono $subnetDisp), (DashMono $v6disp),
+            (DashMono (XText $c 'spoofmac')), (DashMono (XText $c 'mtu')), (DashMono (XText $c 'mss')),
+            $vlanCell, (Format-GatewayRef (XText $c 'gateway')), (YesNo (XHas $c 'blockpriv')), (YesNo $bbog)
+        )
     }
     if (-not $any) { return '' }
     return (Tbl @('Key','Description','Device','Enabled','IPv4 Method','IPv4 Address','Subnet','IPv6','MAC (spoof)','MTU','MSS','VLAN','Gateway','Block RFC1918','Block bogons') $sb.ToString())
@@ -1179,66 +1019,34 @@ function Build-IfGroupsAndL2 {
     $igNodes = XNodes $root 'ifgroups/ifgroupentry'
     if ($igNodes.Count -gt 0) {
         $sb = New-Object System.Text.StringBuilder
-        foreach ($g in $igNodes) {
-            [void]$sb.Append('<tr>')
-            [void]$sb.Append('<td><code class="mono">' + (E (XText $g 'ifname')) + '</code></td>')
-            [void]$sb.Append('<td>' + (DashMono (XText $g 'members')) + '</td>')
-            [void]$sb.Append('<td>' + (Dash (XText $g 'descr')) + '</td>')
-            [void]$sb.Append('</tr>')
-        }
-        [void]$out.Append('<h3>Interface Groups</h3>')
-        [void]$out.Append((Tbl @('Group Name','Members','Description') $sb.ToString()))
+        foreach ($g in $igNodes) { Add-Row $sb @((DashMono (XText $g 'ifname')), (DashMono (XText $g 'members')), (Dash (XText $g 'descr'))) }
+        [void]$out.Append('<h3>Interface Groups</h3>').Append((Tbl @('Group Name','Members','Description') $sb.ToString()))
     }
-
     $laggs = XNodes $root 'laggs/lagg'
     if ($laggs.Count -gt 0) {
         $sb = New-Object System.Text.StringBuilder
-        foreach ($l in $laggs) {
-            [void]$sb.Append('<tr>')
-            [void]$sb.Append('<td>' + (DashMono (XText $l 'laggif')) + '</td>')
-            [void]$sb.Append('<td>' + (Dash (XText $l 'proto')) + '</td>')
-            [void]$sb.Append('<td>' + (DashMono (XText $l 'members')) + '</td>')
-            [void]$sb.Append('<td>' + (Dash (XText $l 'descr')) + '</td>')
-            [void]$sb.Append('</tr>')
-        }
-        [void]$out.Append('<h3>Link Aggregations (LAGG)</h3>')
-        [void]$out.Append((Tbl @('LAGG Interface','Protocol','Member Interfaces','Description') $sb.ToString()))
+        foreach ($l in $laggs) { Add-Row $sb @((DashMono (XText $l 'laggif')), (Dash (XText $l 'proto')), (DashMono (XText $l 'members')), (Dash (XText $l 'descr'))) }
+        [void]$out.Append('<h3>Link Aggregations (LAGG)</h3>').Append((Tbl @('LAGG Interface','Protocol','Member Interfaces','Description') $sb.ToString()))
     }
-
     $bridges = XNodes $root 'bridges/bridged'
     if ($bridges.Count -gt 0) {
         $sb = New-Object System.Text.StringBuilder
-        foreach ($b in $bridges) {
-            [void]$sb.Append('<tr>')
-            [void]$sb.Append('<td>' + (DashMono (XText $b 'bridgeif')) + '</td>')
-            [void]$sb.Append('<td>' + (DashMono (XText $b 'members')) + '</td>')
-            [void]$sb.Append('<td>' + (Dash (XText $b 'descr')) + '</td>')
-            [void]$sb.Append('</tr>')
-        }
-        [void]$out.Append('<h3>Bridges</h3>')
-        [void]$out.Append((Tbl @('Bridge Interface','Member Interfaces','Description') $sb.ToString()))
+        foreach ($b in $bridges) { Add-Row $sb @((DashMono (XText $b 'bridgeif')), (DashMono (XText $b 'members')), (Dash (XText $b 'descr'))) }
+        [void]$out.Append('<h3>Bridges</h3>').Append((Tbl @('Bridge Interface','Member Interfaces','Description') $sb.ToString()))
     }
-
     return $out.ToString()
 }
 
 function Build-Vlans {
     param($root)
-    $vl = $root.SelectSingleNode('vlans')
-    if ($null -eq $vl) { return '' }
-    $nodes = XNodes $vl 'vlan'
+    $nodes = XNodes $root 'vlans/vlan'
     if ($nodes.Count -eq 0) { return '' }
     $sb = New-Object System.Text.StringBuilder
     foreach ($v in $nodes) {
         $vif = XText $v 'vlanif'
-        $rowId = if ($vif) { ' id="vlan-' + (Format-Slug $vif) + '"' } else { '' }
-        [void]$sb.Append('<tr' + $rowId + '>')
-        [void]$sb.Append('<td>' + (DashMono (XText $v 'if')) + '</td>')
-        [void]$sb.Append('<td>' + (DashMono (XText $v 'tag')) + '</td>')
-        [void]$sb.Append('<td>' + (DashMono (XText $v 'pcp')) + '</td>')
-        [void]$sb.Append('<td>' + (DashMono $vif) + '</td>')
-        [void]$sb.Append('<td>' + (Dash (XText $v 'descr')) + '</td>')
-        [void]$sb.Append('</tr>')
+        Add-Row $sb -Id $(if ($vif) { 'vlan-' + (Format-Slug $vif) } else { '' }) -Cells @(
+            (DashMono (XText $v 'if')), (DashMono (XText $v 'tag')), (DashMono (XText $v 'pcp')), (DashMono $vif), (Dash (XText $v 'descr'))
+        )
     }
     return (Tbl @('Parent interface','VLAN tag','Priority (PCP)','VLAN interface','Description') $sb.ToString())
 }
@@ -1249,21 +1057,11 @@ function Build-VirtualIps {
     if ($vips.Count -eq 0) { return '' }
     $sb = New-Object System.Text.StringBuilder
     foreach ($v in $vips) {
-        $subnet = XText $v 'subnet'
-        $bits   = XText $v 'subnet_bits'
-        $addr   = if ($subnet -and $bits) { $subnet + '/' + $bits } else { $subnet }
-        $mode   = XText $v 'mode'
-        $vhid   = XText $v 'vhid'
-        $adv    = XText $v 'advskew'
-        $carpInfo = ''
-        if ($vhid) { $carpInfo = 'VHID ' + $vhid; if ($adv -ne '') { $carpInfo += ', skew ' + $adv } }
-        [void]$sb.Append('<tr>')
-        [void]$sb.Append('<td>' + (Dash $mode.ToUpperInvariant()) + '</td>')
-        [void]$sb.Append('<td>' + (DashMono (XText $v 'interface')) + '</td>')
-        [void]$sb.Append('<td>' + (DashMono $addr) + '</td>')
-        [void]$sb.Append('<td>' + (DashMono $carpInfo) + '</td>')
-        [void]$sb.Append('<td>' + (Dash (XText $v 'descr')) + '</td>')
-        [void]$sb.Append('</tr>')
+        $subnet = XText $v 'subnet'; $bits = XText $v 'subnet_bits'
+        $addr = if ($subnet -and $bits) { "$subnet/$bits" } else { $subnet }
+        $vhid = XText $v 'vhid'; $adv = XText $v 'advskew'
+        $carpInfo = if ($vhid) { "VHID $vhid" + $(if ($adv -ne '') { ", skew $adv" } else { '' }) } else { '' }
+        Add-Row $sb @((Dash (XText $v 'mode').ToUpperInvariant()), (DashMono (XText $v 'interface')), (DashMono $addr), (DashMono $carpInfo), (Dash (XText $v 'descr')))
     }
     return (Tbl @('Type','Interface','Address / Subnet','CARP (VHID / Skew)','Description') $sb.ToString())
 }
@@ -1272,10 +1070,8 @@ function Build-Gateways {
     param($root)
     $gws = $root.SelectSingleNode('gateways')
     if ($null -eq $gws) { return '' }
-    $def4 = XText $gws 'defaultgw4'
-    $def6 = XText $gws 'defaultgw6'
-    $items  = XNodes $gws 'gateway_item'
-    $groups = XNodes $gws 'gateway_group'
+    $def4 = XText $gws 'defaultgw4'; $def6 = XText $gws 'defaultgw6'
+    $items = XNodes $gws 'gateway_item'; $groups = XNodes $gws 'gateway_group'
     if ($items.Count -eq 0 -and $groups.Count -eq 0 -and -not $def4 -and -not $def6) { return '' }
 
     $out = New-Object System.Text.StringBuilder
@@ -1285,23 +1081,13 @@ function Build-Gateways {
     if ($items.Count -gt 0) {
         $sb = New-Object System.Text.StringBuilder
         foreach ($g in $items) {
-            $name = XText $g 'name'
-            $disabled = XHas $g 'disabled'
-            $monDis   = XHas $g 'monitor_disable'
-            $isDef    = ($name -and (($name -eq $def4) -or ($name -eq $def6)))
-            $rowId    = if ($name) { ' id="gw-' + (Format-Slug $name) + '"' } else { '' }
-            $cls      = if ($disabled) { ' class="row-disabled"' } else { '' }
-            $monDisp  = if ($monDis) { '<span class="badge badge-muted">Disabled</span>' } else { DashMono (XText $g 'monitor') }
-            [void]$sb.Append('<tr' + $rowId + $cls + '>')
-            [void]$sb.Append('<td>' + (DashMono $name) + '</td>')
-            [void]$sb.Append('<td>' + (YesNo (-not $disabled)) + '</td>')
-            [void]$sb.Append('<td>' + (DashMono (XText $g 'interface')) + '</td>')
-            [void]$sb.Append('<td>' + (DashMono (XText $g 'gateway')) + '</td>')
-            [void]$sb.Append('<td>' + $monDisp + '</td>')
-            [void]$sb.Append('<td>' + (Dash (XText $g 'ipprotocol')) + '</td>')
-            [void]$sb.Append('<td>' + $(if ($isDef) { '<span class="badge badge-info">DEFAULT</span>' } else { '<span class="muted">&mdash;</span>' }) + '</td>')
-            [void]$sb.Append('<td>' + (Dash (XText $g 'descr')) + '</td>')
-            [void]$sb.Append('</tr>')
+            $name = XText $g 'name'; $disabled = XHas $g 'disabled'
+            $isDef = ($name -and ($name -eq $def4 -or $name -eq $def6))
+            $monDisp = if (XHas $g 'monitor_disable') { Badge 'Disabled' 'muted' $true } else { DashMono (XText $g 'monitor') }
+            Add-Row $sb -Id $(if ($name) { 'gw-' + (Format-Slug $name) } else { '' }) -Disabled $disabled -Cells @(
+                (DashMono $name), (YesNo (-not $disabled)), (DashMono (XText $g 'interface')), (DashMono (XText $g 'gateway')),
+                $monDisp, (Dash (XText $g 'ipprotocol')), $(if ($isDef) { Badge 'DEFAULT' 'info' $true } else { '<span class="muted">&mdash;</span>' }), (Dash (XText $g 'descr'))
+            )
         }
         [void]$out.Append((Tbl @('Name','Enabled','Interface','Gateway IP','Monitor IP','Protocol','Default','Description') $sb.ToString()))
     }
@@ -1309,59 +1095,41 @@ function Build-Gateways {
         $sb = New-Object System.Text.StringBuilder
         foreach ($gg in $groups) {
             $gn = XText $gg 'name'
-            $rowId = if ($gn) { ' id="gwg-' + (Format-Slug $gn) + '"' } else { '' }
-            $members = New-Object 'System.Collections.Generic.List[string]'
-            foreach ($m in (XNodes $gg 'item')) {
-                $parts = $m.InnerText.Trim() -split '\|'
-                if ($parts.Count -ge 2) { [void]$members.Add(($parts[0] + ' (Tier ' + $parts[1] + ')')) }
-                elseif ($m.InnerText.Trim()) { [void]$members.Add($m.InnerText.Trim()) }
-            }
-            [void]$sb.Append('<tr' + $rowId + '>')
-            [void]$sb.Append('<td>' + (DashMono $gn) + '</td>')
-            [void]$sb.Append('<td>' + $(if ($members.Count) { ($members | ForEach-Object { '<code class="mono">' + (E $_) + '</code>' }) -join '<br>' } else { '<span class="muted">&mdash;</span>' }) + '</td>')
-            [void]$sb.Append('<td>' + (Dash (XText $gg 'trigger')) + '</td>')
-            [void]$sb.Append('<td>' + (Dash (XText $gg 'descr')) + '</td>')
-            [void]$sb.Append('</tr>')
+            $members = @(foreach ($m in (XNodes $gg 'item')) {
+                $parts = @($m.InnerText.Trim() -split '\|')
+                if ($parts.Count -ge 2) { $parts[0] + ' (Tier ' + $parts[1] + ')' } elseif ($m.InnerText.Trim()) { $m.InnerText.Trim() }
+            })
+            Add-Row $sb -Id $(if ($gn) { 'gwg-' + (Format-Slug $gn) } else { '' }) -Cells @(
+                (DashMono $gn), (Format-ListCell $members -Mode 'mono'), (Dash (XText $gg 'trigger')), (Dash (XText $gg 'descr'))
+            )
         }
-        [void]$out.Append('<h3>Gateway Groups</h3>')
-        [void]$out.Append((Tbl @('Group Name','Members &amp; Tiers','Trigger Level','Description') $sb.ToString()))
+        [void]$out.Append('<h3>Gateway Groups</h3>').Append((Tbl @('Group Name','Members &amp; Tiers','Trigger Level','Description') $sb.ToString()))
     }
     return $out.ToString()
 }
 
 function Build-Routes {
     param($root)
-    $sr = $root.SelectSingleNode('staticroutes')
-    if ($null -eq $sr) { return '' }
-    $routes = XNodes $sr 'route'
+    $routes = XNodes $root 'staticroutes/route'
     if ($routes.Count -eq 0) { return '' }
     $sb = New-Object System.Text.StringBuilder
     foreach ($r in $routes) {
         $disabled = XHas $r 'disabled'
-        $cls = if ($disabled) { ' class="row-disabled"' } else { '' }
-        [void]$sb.Append('<tr' + $cls + '>')
-        [void]$sb.Append('<td>' + (DashMono (XText $r 'network')) + '</td>')
-        [void]$sb.Append('<td>' + (Format-GatewayRef (XText $r 'gateway')) + '</td>')
-        [void]$sb.Append('<td>' + (YesNo (-not $disabled)) + '</td>')
-        [void]$sb.Append('<td>' + (Dash (XText $r 'descr')) + '</td>')
-        [void]$sb.Append('</tr>')
+        Add-Row $sb -Disabled $disabled -Cells @(
+            (DashMono (XText $r 'network')), (Format-GatewayRef (XText $r 'gateway')), (YesNo (-not $disabled)), (Dash (XText $r 'descr'))
+        )
     }
     return (Tbl @('Destination network','Gateway','Enabled','Description') $sb.ToString())
 }
 
 function Test-Broad {
-    # True when an endpoint address is effectively "everything" (any / negated / default route).
     param([string]$addr)
     if ([string]::IsNullOrWhiteSpace($addr)) { return $true }
     $a = $addr.Trim()
-    if ($a -eq 'any') { return $true }
-    if ($a -like '! *') { return $true }
-    if ($a -eq '0.0.0.0/0' -or $a -eq '::/0') { return $true }
-    return $false
+    return ($a -eq 'any' -or $a -like '! *' -or $a -eq '0.0.0.0/0' -or $a -eq '::/0')
 }
 
 function Get-ProtoClass {
-    # Classify a rule protocol into a risk tier.
     param([string]$proto)
     $p = (($proto -replace '/.*$', '')).ToLowerInvariant().Trim()
     if ($p -in @('icmp', 'icmp6', 'ipv6-icmp', 'igmp')) { return 'icmp' }
@@ -1372,25 +1140,13 @@ function Get-ProtoClass {
 }
 
 function Get-RuleExposure {
-    # Context-aware risk for a single PASS rule, scaled by interface trust + protocol + management exposure.
     param(
-        [string]$trust,
-        [string]$type,
-        [string]$dir,
-        [string]$protoClass,
-        [bool]$srcBroad,
-        [bool]$dstBroad,
-        [bool]$dstPortSet,
-        [string]$protoDisp,
-        [string]$dstSvc,
-        [bool]$isFirewallMgmt = $false,
-        [bool]$floatingTouchesWan = $false
+        [string]$trust, [string]$type, [string]$dir, [string]$protoClass,
+        [bool]$srcBroad, [bool]$dstBroad, [bool]$dstPortSet, [string]$protoDisp, [string]$dstSvc,
+        [bool]$isFirewallMgmt = $false, [bool]$floatingTouchesWan = $false
     )
-    if ($type -ne 'pass') { return $null }   # block/reject/match rules are not exposures
-    if ($dir -eq 'out')   { return $null }   # outbound allows are not inbound exposure
-
-    $effectiveTrust = $trust
-    if ($trust -eq 'floating' -and $floatingTouchesWan) { $effectiveTrust = 'wan' }
+    if ($type -ne 'pass' -or $dir -eq 'out') { return $null }
+    $effectiveTrust = if ($trust -eq 'floating' -and $floatingTouchesWan) { 'wan' } else { $trust }
 
     switch ($effectiveTrust) {
         'wan' {
@@ -1406,26 +1162,20 @@ function Get-RuleExposure {
                 }
                 return @{ Sev = 'warn'; Label = 'WAN EXPOSED'; Detail = "inbound $protoDisp service published to the Internet (any source -> $dstSvc)."; Row = 'row-warn' }
             }
-            else {
-                if ($protoClass -in @('tcpudp', 'any', 'other')) {
-                    return @{ Sev = 'info'; Label = 'WAN (restricted)'; Detail = 'inbound WAN allow limited to specific source(s) - lower risk.'; Row = '' }
-                }
-                return $null
+            if ($protoClass -in @('tcpudp', 'any', 'other')) {
+                return @{ Sev = 'info'; Label = 'WAN (restricted)'; Detail = 'inbound WAN allow limited to specific source(s) - lower risk.'; Row = '' }
             }
         }
         'vpn' {
             if ($srcBroad -and $dstBroad -and ($protoClass -in @('tcpudp', 'any', 'other'))) {
                 return @{ Sev = 'info'; Label = 'VPN ANY'; Detail = 'VPN interface permits any-to-any (common for full-tunnel remote access).'; Row = '' }
             }
-            return $null
         }
         'floating' {
             if ($srcBroad -and $dstBroad -and ($protoClass -in @('tcpudp', 'any'))) {
                 return @{ Sev = 'warn'; Label = 'FLOATING ANY'; Detail = 'floating rule permits any-to-any; verify the intended scope.'; Row = 'row-warn' }
             }
-            return $null
         }
-        default { return $null }   # internal / trusted interfaces: any-to-any is expected
     }
     return $null
 }
@@ -1435,7 +1185,6 @@ function Build-Firewall {
     $rules = XNodes $root 'filter/rule'
     if ($rules.Count -eq 0) { return '' }
 
-    # Detect management ports for WAN management exposure check
     $sysNode  = $root.SelectSingleNode('system')
     $guiNode  = if ($null -ne $sysNode) { $sysNode.SelectSingleNode('webgui') } else { $null }
     $guiProto = XText $guiNode 'protocol'; if (-not $guiProto) { $guiProto = 'https' }
@@ -1444,19 +1193,12 @@ function Build-Firewall {
     $sshPort  = XText $sshNode 'port'; if (-not $sshPort) { $sshPort = '22' }
     $mgmtPorts = @($guiPort, $sshPort)
 
-    # Floating rules first (matches pfSense evaluation order)
+    # Group floating rules first (pfSense evaluation order)
     $groups = [ordered]@{}
     $floatingList = New-Object 'System.Collections.Generic.List[object]'
     foreach ($r in $rules) {
-        if (XHas $r 'floating') {
-            [void]$floatingList.Add($r)
-            continue
-        }
-        $ifKey = XText $r 'interface'
-        if (-not $ifKey) {
-            [void]$floatingList.Add($r)
-            continue
-        }
+        $ifKey = if (XHas $r 'floating') { '' } else { XText $r 'interface' }
+        if (-not $ifKey) { [void]$floatingList.Add($r); continue }
         if (-not $groups.Contains($ifKey)) { $groups[$ifKey] = New-Object 'System.Collections.Generic.List[object]' }
         [void]$groups[$ifKey].Add($r)
     }
@@ -1473,16 +1215,15 @@ function Build-Firewall {
     foreach ($key in $groups.Keys) {
         $trust = if ($script:TrustMap.ContainsKey($key)) { $script:TrustMap[$key] } else { 'other' }
         $trustBadge = switch ($trust) {
-            'wan'      { ' <span class="badge badge-high">UNTRUSTED / WAN</span>' }
-            'vpn'      { ' <span class="badge badge-info">VPN</span>' }
-            'floating' { ' <span class="badge badge-muted">FLOATING</span>' }
-            'internal' { ' <span class="badge badge-ok">TRUSTED / INTERNAL</span>' }
+            'wan'      { ' ' + (Badge 'UNTRUSTED / WAN' 'high' $true) }
+            'vpn'      { ' ' + (Badge 'VPN' 'info' $true) }
+            'floating' { ' ' + (Badge 'FLOATING' 'muted' $true) }
+            'internal' { ' ' + (Badge 'TRUSTED / INTERNAL' 'ok' $true) }
             default    { '' }
         }
         $label = '<code class="mono">' + (E $key) + '</code>'
-        if ($script:IfMap.ContainsKey($key) -and $script:IfMap[$key]) {
-            $label += ' <span class="muted">&mdash; ' + (E $script:IfMap[$key]) + '</span>'
-        }
+        if ($script:IfMap.ContainsKey($key) -and $script:IfMap[$key]) { $label += ' <span class="muted">&mdash; ' + (E $script:IfMap[$key]) + '</span>' }
+
         $sb = New-Object System.Text.StringBuilder
         $seq = 0
         $isFloatingGroup = ($key -eq '(floating)')
@@ -1491,114 +1232,70 @@ function Build-Firewall {
             $rowId    = 'row-fw-' + (Format-Slug $key) + '-' + $seq
             $disabled = XHas $r 'disabled'
             $type     = XText $r 'type'
-            $ipproto  = XText $r 'ipprotocol'
-            $ipDisp   = switch ($ipproto) {
-                'inet'   { 'IPv4' }
-                'inet6'  { 'IPv6' }
-                'inet46' { 'IPv4+6' }
-                default  { if ($ipproto) { $ipproto } else { 'IPv4' } }
-            }
-            $rawProto   = XText $r 'protocol'
-            $protoClass = Get-ProtoClass $rawProto
-            $proto      = if ($rawProto) { $rawProto } else { 'any' }
-            if ($rawProto -in @('icmp', 'icmp6', 'ipv6-icmp')) {
-                $it = XText $r 'icmptype'
-                if ($it) { $proto = $rawProto + '/' + $it }
-            }
-            $src   = Format-Endpoint $r.SelectSingleNode('source')
-            $dst   = Format-Endpoint $r.SelectSingleNode('destination')
-            $dir   = XText $r 'direction'; if (-not $dir) { $dir = 'in' }
-            $quick = XHas $r 'quick'
-            $log   = XHas $r 'log'
-            $gw    = XText $r 'gateway'
-            $sched = XText $r 'sched'
-            $descr = XText $r 'descr'
+            $ipDisp   = switch (XText $r 'ipprotocol') { 'inet' { 'IPv4' } 'inet6' { 'IPv6' } 'inet46' { 'IPv4+6' } default { if ($_) { $_ } else { 'IPv4' } } }
+            $rawProto = XText $r 'protocol'; $protoClass = Get-ProtoClass $rawProto
+            $proto    = if ($rawProto) { $rawProto } else { 'any' }
+            if ($rawProto -in @('icmp', 'icmp6', 'ipv6-icmp')) { $it = XText $r 'icmptype'; if ($it) { $proto = "$rawProto/$it" } }
+
+            $src = Format-Endpoint $r.SelectSingleNode('source')
+            $dst = Format-Endpoint $r.SelectSingleNode('destination')
+            $dir = XText $r 'direction'; if (-not $dir) { $dir = 'in' }
+            $log = XHas $r 'log'; $descr = XText $r 'descr'; $sched = XText $r 'sched'
+
             $floatIfs = if ($isFloatingGroup) { XText $r 'interface' } else { '' }
             $floatingTouchesWan = $false
             if ($isFloatingGroup) {
-                if (-not $floatIfs) {
-                    $floatingTouchesWan = $true
-                }
-                else {
-                    foreach ($fi in ($floatIfs -split ',')) {
-                        $fk = $fi.Trim()
-                        if ($fk -and $script:TrustMap.ContainsKey($fk) -and $script:TrustMap[$fk] -eq 'wan') {
-                            $floatingTouchesWan = $true; break
-                        }
-                    }
-                }
+                $floatingTouchesWan = (-not $floatIfs) -or (@($floatIfs -split ',' | Where-Object {
+                    $fk = $_.Trim(); $fk -and $script:TrustMap.ContainsKey($fk) -and $script:TrustMap[$fk] -eq 'wan'
+                }).Count -gt 0)
             }
 
-            $srcBroad = Test-Broad $src.Addr
-            $dstBroad = Test-Broad $dst.Addr
-            $dstIsSelf = ($dst.RawAddr -eq '(self)' -or $dst.RawAddr -match '^wanip$' -or ($key -ne '(floating)' -and $dst.RawAddr -eq ($key + 'ip')))
-            $isMgmt = $dstIsSelf -and (($dst.Port -in $mgmtPorts) -or (-not $dst.Port -and $protoClass -in @('tcpudp', 'any')))
+            $dstIsSelf = ($dst.RawAddr -eq '(self)' -or $dst.RawAddr -eq 'wanip' -or (-not $isFloatingGroup -and $dst.RawAddr -eq ($key + 'ip')))
+            $isMgmt    = $dstIsSelf -and (($dst.Port -in $mgmtPorts) -or (-not $dst.Port -and $protoClass -in @('tcpudp', 'any')))
+            $where     = "Firewall / $key rule #$seq"
+            $badges    = New-Object System.Text.StringBuilder
+            $rowCls    = if ($disabled) { 'row-disabled' } else { '' }
 
-            $where  = "Firewall / $key rule #$seq"
-            $badges = New-Object System.Text.StringBuilder
-            $rowCls = ''
-            if ($disabled) {
-                $rowCls = 'row-disabled'
-                [void]$badges.Append('<span class="badge badge-muted">DISABLED</span> ')
-            }
-            if ($isFloatingGroup) {
-                if ($floatIfs) { [void]$badges.Append('<span class="badge badge-muted">IF: ' + (E $floatIfs) + '</span> ') }
-                if ($quick)    { [void]$badges.Append('<span class="badge badge-info">QUICK</span> ') }
-            }
-            if ($sched) { [void]$badges.Append('<span class="badge badge-muted">SCHED: ' + (E $sched) + '</span> ') }
+            if ($disabled) { [void]$badges.Append((Badge 'DISABLED' 'muted' $true)).Append(' ') }
+            if ($isFloatingGroup -and $floatIfs) { [void]$badges.Append((Badge ("IF: $floatIfs") 'muted')).Append(' ') }
+            if ($isFloatingGroup -and (XHas $r 'quick')) { [void]$badges.Append((Badge 'QUICK' 'info' $true)).Append(' ') }
+            if ($sched) { [void]$badges.Append((Badge ("SCHED: $sched") 'muted')).Append(' ') }
 
             if (-not $disabled) {
-                $dstSvc = $dst.Addr; if ($dst.Port) { $dstSvc += ':' + $dst.Port }
-                $exp = Get-RuleExposure -trust $trust -type $type -dir $dir -protoClass $protoClass -srcBroad $srcBroad -dstBroad $dstBroad -dstPortSet ([bool]$dst.Port) -protoDisp $proto -dstSvc $dstSvc -isFirewallMgmt $isMgmt -floatingTouchesWan $floatingTouchesWan
+                $dstSvc = $dst.Addr + $(if ($dst.Port) { ':' + $dst.Port } else { '' })
+                $exp = Get-RuleExposure -trust $trust -type $type -dir $dir -protoClass $protoClass `
+                    -srcBroad (Test-Broad $src.Addr) -dstBroad (Test-Broad $dst.Addr) -dstPortSet ([bool]$dst.Port) `
+                    -protoDisp $proto -dstSvc $dstSvc -isFirewallMgmt $isMgmt -floatingTouchesWan $floatingTouchesWan
                 if ($null -ne $exp) {
-                    $bcls = switch ($exp.Sev) { 'high' { 'badge-high' } 'warn' { 'badge-warn' } default { 'badge-info' } }
-                    [void]$badges.Append('<span class="badge ' + $bcls + '">' + (E $exp.Label) + '</span> ')
-                    if ($exp.Row -and $rowCls -eq '') { $rowCls = $exp.Row }
+                    $kind = switch ($exp.Sev) { 'high' { 'high' } 'warn' { 'warn' } default { 'info' } }
+                    [void]$badges.Append((Badge $exp.Label $kind)).Append(' ')
+                    if ($exp.Row -and -not $rowCls) { $rowCls = $exp.Row }
                     Add-Finding $exp.Sev $exp.Label $where ($(if ($descr) { $descr } else { '(no description)' }) + ' - ' + $exp.Detail) $rowId
                 }
                 if (-not $log) {
-                    [void]$badges.Append('<span class="badge badge-muted">NO LOG</span> ')
-                    # De-noise Findings: report individual NO LOG findings for WAN/floating/block/reject rules;
-                    # aggregate internal pass rules into one clean summary finding.
+                    [void]$badges.Append((Badge 'NO LOG' 'muted' $true)).Append(' ')
                     if ($trust -in @('wan', 'floating') -or $type -in @('block', 'reject')) {
                         Add-Finding 'info' 'NO LOG' $where ($(if ($descr) { $descr } else { '(no description)' }) + ' - logging is disabled on this rule.') $rowId
                     }
-                    else {
-                        $script:InternalNoLogCount++
-                    }
+                    else { $script:InternalNoLogCount++ }
                 }
             }
 
             $actBadge = switch ($type) {
-                'pass'   { '<span class="badge badge-ok">PASS</span>' }
-                'block'  { '<span class="badge badge-muted">BLOCK</span>' }
-                'reject' { '<span class="badge badge-warn">REJECT</span>' }
-                'match'  { '<span class="badge badge-info">MATCH</span>' }
-                default  { (E $type) }
+                'pass' { Badge 'PASS' 'ok' $true } 'block' { Badge 'BLOCK' 'muted' $true }
+                'reject' { Badge 'REJECT' 'warn' $true } 'match' { Badge 'MATCH' 'info' $true }
+                default { E $type }
             }
-
-            $trAttr = ' id="' + $rowId + '"'
-            if ($rowCls) { $trAttr += ' class="' + $rowCls + '"' }
-            if ($disabled) { $trAttr += ' data-disabled="1"' }
-            [void]$sb.Append('<tr' + $trAttr + '>')
-            [void]$sb.Append('<td>' + $seq + '</td>')
-            [void]$sb.Append('<td>' + (YesNo (-not $disabled)) + '</td>')
-            [void]$sb.Append('<td>' + $actBadge + '</td>')
-            [void]$sb.Append('<td>' + (E $ipDisp) + '</td>')
-            [void]$sb.Append('<td><code class="mono">' + (E $proto) + '</code></td>')
-            [void]$sb.Append('<td>' + (Format-RefCell $src.Addr $src.Negated) + '</td>')
-            [void]$sb.Append('<td>' + (Format-RefCell $src.Port) + '</td>')
-            [void]$sb.Append('<td>' + (Format-RefCell $dst.Addr $dst.Negated) + '</td>')
-            [void]$sb.Append('<td>' + (Format-RefCell $dst.Port) + '</td>')
-            [void]$sb.Append('<td>' + (Format-GatewayRef $gw) + '</td>')
-            [void]$sb.Append('<td>' + (E $dir) + '</td>')
-            [void]$sb.Append('<td>' + (YesNo $log) + '</td>')
             $flagHtml = if ($badges.Length -gt 0) { '<div class="flagcell">' + $badges.ToString().Trim() + '</div>' } else { '' }
-            [void]$sb.Append('<td>' + (Dash $descr) + $flagHtml + '</td>')
-            [void]$sb.Append('</tr>')
+            Add-Row $sb -Id $rowId -Class $rowCls -Disabled $disabled -Cells @(
+                [string]$seq, (YesNo (-not $disabled)), $actBadge, (E $ipDisp), (DashMono $proto),
+                (Format-RefCell $src.Addr $src.Negated), (Format-RefCell $src.Port),
+                (Format-RefCell $dst.Addr $dst.Negated), (Format-RefCell $dst.Port),
+                (Format-GatewayRef (XText $r 'gateway')), (E $dir), (YesNo $log), ((Dash $descr) + $flagHtml)
+            )
         }
-        $tbl = Tbl @('#','Enabled','Action','IP','Protocol','Source','Src Port','Destination','Dst Port','Gateway','Dir','Log','Description / Flags') $sb.ToString() 'filterable-table'
         $cnt = $groups[$key].Count
+        $tbl = Tbl @('#','Enabled','Action','IP','Protocol','Source','Src Port','Destination','Dst Port','Gateway','Dir','Log','Description / Flags') $sb.ToString() 'filterable-table'
         [void]$out.Append('<h3 class="iface-head">' + $label + $trustBadge + ' <span class="count">(' + $cnt + ' rule' + $(if ($cnt -ne 1) { 's' } else { '' }) + ')</span></h3>' + $tbl)
     }
 
@@ -1616,54 +1313,30 @@ function Build-Nat {
     [void]$out.Append('<div class="section-controls"><span></span><label class="toggle-check"><input type="checkbox" class="hide-disabled-toggle" data-target="nat" /> Hide disabled rules</label></div>')
 
     # Outbound NAT
-    $mode = XText $nat 'outbound/mode'
-    if (-not $mode) { $mode = 'automatic' }
-    [void]$out.Append('<h3>Outbound NAT</h3><p>Mode: <span class="badge badge-info">' + (E $mode.ToUpperInvariant()) + '</span></p>')
+    $mode = XText $nat 'outbound/mode'; if (-not $mode) { $mode = 'automatic' }
+    [void]$out.Append('<h3>Outbound NAT</h3><p>Mode: ' + (Badge $mode.ToUpperInvariant() 'info') + '</p>')
     $obRules = XNodes $nat 'outbound/rule'
     if ($obRules.Count -gt 0) {
         $sb = New-Object System.Text.StringBuilder
         foreach ($r in $obRules) {
             $disabled = XHas $r 'disabled'
-            $noNat    = XHas $r 'nonat'
-            $statPort = XHas $r 'staticnatport'
-            $trAttr   = if ($disabled) { ' class="row-disabled" data-disabled="1"' } else { '' }
-            $src = Format-Endpoint $r.SelectSingleNode('source')
-            $srcPort = XText $r 'sourceport'
-            $dst = Format-Endpoint $r.SelectSingleNode('destination')
-            $dstPort = if ($dst.Port) { $dst.Port } else { XText $r 'dstport' }
-            $proto   = XText $r 'protocol'; if (-not $proto) { $proto = 'any' }
-
-            $tgtCell = ''
-            if ($noNat) {
-                $tgtCell = '<span class="badge badge-warn">DO NOT NAT</span>'
+            $src = Format-Endpoint $r.SelectSingleNode('source'); $srcPort = XText $r 'sourceport'
+            $dst = Format-Endpoint $r.SelectSingleNode('destination'); $dstPort = if ($dst.Port) { $dst.Port } else { XText $r 'dstport' }
+            $proto = XText $r 'protocol'; if (-not $proto) { $proto = 'any' }
+            if (XHas $r 'nonat') {
+                $tgtCell = Badge 'DO NOT NAT' 'warn' $true
             }
             else {
                 $tgt = XText $r 'targetip'
-                if ($tgt) {
-                    $tsub = XText $r 'targetip_subnet'
-                    if ($tsub) { $tgt += '/' + $tsub }
-                }
-                else {
-                    $tgt = XText $r 'target'
-                }
+                if ($tgt) { $tsub = XText $r 'targetip_subnet'; if ($tsub) { $tgt += '/' + $tsub } } else { $tgt = XText $r 'target' }
                 if (-not $tgt -or $tgt -eq 'other-subnet') { $tgt = 'Interface address' }
-                $tgtCell = DashMono $tgt
-                if ($statPort) { $tgtCell += ' <span class="badge badge-info">STATIC PORT</span>' }
+                $tgtCell = (DashMono $tgt) + $(if (XHas $r 'staticnatport') { ' ' + (Badge 'STATIC PORT' 'info' $true) } else { '' })
             }
-            $srcCell = Format-RefCell $src.Addr $src.Negated
-            if ($srcPort) { $srcCell += ':<code class="mono">' + (E $srcPort) + '</code>' }
-            $dstCell = Format-RefCell $dst.Addr $dst.Negated
-            if ($dstPort) { $dstCell += ':<code class="mono">' + (E $dstPort) + '</code>' }
-
-            [void]$sb.Append('<tr' + $trAttr + '>')
-            [void]$sb.Append('<td>' + (DashMono (XText $r 'interface')) + '</td>')
-            [void]$sb.Append('<td><code class="mono">' + (E $proto) + '</code></td>')
-            [void]$sb.Append('<td>' + $srcCell + '</td>')
-            [void]$sb.Append('<td>' + $dstCell + '</td>')
-            [void]$sb.Append('<td>' + $tgtCell + '</td>')
-            [void]$sb.Append('<td>' + (YesNo (-not $disabled)) + '</td>')
-            [void]$sb.Append('<td>' + (Dash (XText $r 'descr')) + '</td>')
-            [void]$sb.Append('</tr>')
+            $srcCell = (Format-RefCell $src.Addr $src.Negated) + $(if ($srcPort) { ':<code class="mono">' + (E $srcPort) + '</code>' } else { '' })
+            $dstCell = (Format-RefCell $dst.Addr $dst.Negated) + $(if ($dstPort) { ':<code class="mono">' + (E $dstPort) + '</code>' } else { '' })
+            Add-Row $sb -Disabled $disabled -Cells @(
+                (DashMono (XText $r 'interface')), (DashMono $proto), $srcCell, $dstCell, $tgtCell, (YesNo (-not $disabled)), (Dash (XText $r 'descr'))
+            )
         }
         [void]$out.Append((Tbl @('Interface','Proto','Source','Destination','Translation target','Enabled','Description') $sb.ToString() 'filterable-table'))
     }
@@ -1675,56 +1348,34 @@ function Build-Nat {
     $pf = XNodes $nat 'rule'
     [void]$out.Append('<h3>Port Forwards</h3>')
     if ($pf.Count -gt 0) {
-        $sb = New-Object System.Text.StringBuilder
-        $pfSeq = 0
+        $sb = New-Object System.Text.StringBuilder; $pfSeq = 0
         foreach ($r in $pf) {
-            $pfSeq++
-            $rowId    = 'row-nat-pf-' + $pfSeq
-            $disabled = XHas $r 'disabled'
-            $noRdr    = XHas $r 'nordr'
-            $assoc    = XText $r 'associated-rule-id'
-            $iface    = XText $r 'interface'
-            $proto    = XText $r 'protocol'
-            $src      = Format-Endpoint $r.SelectSingleNode('source')
-            $dst      = Format-Endpoint $r.SelectSingleNode('destination')
-            $extPort  = if ($dst.Port) { $dst.Port } else { XText $r 'dstport' }
-            $target   = XText $r 'target'
-            $locPort  = XText $r 'local-port'
-            $descr    = XText $r 'descr'
+            $pfSeq++; $rowId = "row-nat-pf-$pfSeq"
+            $disabled = XHas $r 'disabled'; $noRdr = XHas $r 'nordr'
+            $iface = XText $r 'interface'; $proto = XText $r 'protocol'; $target = XText $r 'target'; $locPort = XText $r 'local-port'; $descr = XText $r 'descr'
+            $src = Format-Endpoint $r.SelectSingleNode('source'); $dst = Format-Endpoint $r.SelectSingleNode('destination')
+            $extPort = if ($dst.Port) { $dst.Port } else { XText $r 'dstport' }
 
             $flags = New-Object System.Text.StringBuilder
             $rowCls = if ($disabled) { 'row-disabled' } else { '' }
-            if ($noRdr) { [void]$flags.Append('<span class="badge badge-warn">NO RDR</span> ') }
-            if (-not $disabled -and -not $noRdr -and $assoc -ieq 'pass') {
+            if ($noRdr) { [void]$flags.Append((Badge 'NO RDR' 'warn' $true)).Append(' ') }
+            if (-not $disabled -and -not $noRdr -and (XText $r 'associated-rule-id') -ieq 'pass') {
                 $isWan = $script:TrustMap.ContainsKey($iface) -and $script:TrustMap[$iface] -eq 'wan'
                 $sev = if ($isWan -and (Test-Broad $src.Addr)) { 'warn' } else { 'info' }
-                $bcls = if ($sev -eq 'warn') { 'badge-warn' } else { 'badge-info' }
-                [void]$flags.Append('<span class="badge ' + $bcls + '">INLINE PASS</span> ')
+                [void]$flags.Append((Badge 'INLINE PASS' $sev $true)).Append(' ')
                 if ($sev -eq 'warn' -and -not $rowCls) { $rowCls = 'row-warn' }
                 Add-Finding $sev 'NAT INLINE PASS' "NAT / Port Forward #$pfSeq" ("$(if ($descr) { $descr } else { '(no description)' }) - uses implicit 'pass' (bypasses explicit firewall rules) forwarding $($proto):$($extPort) -> $($target):$($locPort).") $rowId
             }
-
-            $trAttr = ' id="' + $rowId + '"'
-            if ($rowCls) { $trAttr += ' class="' + $rowCls + '"' }
-            if ($disabled) { $trAttr += ' data-disabled="1"' }
-            [void]$sb.Append('<tr' + $trAttr + '>')
-            [void]$sb.Append('<td>' + (DashMono $iface) + '</td>')
-            [void]$sb.Append('<td>' + (DashMono $proto) + '</td>')
-            [void]$sb.Append('<td>' + (Format-RefCell $src.Addr $src.Negated) + '</td>')
-            [void]$sb.Append('<td>' + (Format-RefCell $dst.Addr $dst.Negated) + '</td>')
-            [void]$sb.Append('<td>' + (Format-RefCell $extPort) + '</td>')
-            [void]$sb.Append('<td>' + (Format-RefCell $target) + '</td>')
-            [void]$sb.Append('<td>' + (Format-RefCell $locPort) + '</td>')
-            [void]$sb.Append('<td>' + (YesNo (-not $disabled)) + '</td>')
             $flagHtml = if ($flags.Length -gt 0) { '<div class="flagcell">' + $flags.ToString().Trim() + '</div>' } else { '' }
-            [void]$sb.Append('<td>' + (Dash $descr) + $flagHtml + '</td>')
-            [void]$sb.Append('</tr>')
+            Add-Row $sb -Id $rowId -Class $rowCls -Disabled $disabled -Cells @(
+                (DashMono $iface), (DashMono $proto), (Format-RefCell $src.Addr $src.Negated),
+                (Format-RefCell $dst.Addr $dst.Negated), (Format-RefCell $extPort), (Format-RefCell $target),
+                (Format-RefCell $locPort), (YesNo (-not $disabled)), ((Dash $descr) + $flagHtml)
+            )
         }
         [void]$out.Append((Tbl @('Interface','Protocol','Source','External addr','External port','Redirect target','Target port','Enabled','Description / Flags') $sb.ToString() 'filterable-table'))
     }
-    else {
-        [void]$out.Append('<p class="not-configured">No port forwards defined.</p>')
-    }
+    else { [void]$out.Append('<p class="not-configured">No port forwards defined.</p>') }
 
     # 1:1 NAT
     $oto = XNodes $nat 'onetoone'
@@ -1733,24 +1384,15 @@ function Build-Nat {
         $sb = New-Object System.Text.StringBuilder
         foreach ($r in $oto) {
             $disabled = XHas $r 'disabled'
-            $noBinat  = XHas $r 'nobinat'
-            $trAttr   = if ($disabled) { ' class="row-disabled" data-disabled="1"' } else { '' }
-            $src = Format-Endpoint $r.SelectSingleNode('source')
-            $dst = Format-Endpoint $r.SelectSingleNode('destination')
-            $extCell = DashMono (XText $r 'external')
-            if ($noBinat) { $extCell += ' <span class="badge badge-warn">DO NOT BINAT</span>' }
-            [void]$sb.Append('<tr' + $trAttr + '>')
-            [void]$sb.Append('<td>' + (DashMono (XText $r 'interface')) + '</td>')
-            [void]$sb.Append('<td>' + $extCell + '</td>')
-            [void]$sb.Append('<td>' + (Format-RefCell $src.Addr $src.Negated) + '</td>')
-            [void]$sb.Append('<td>' + (Format-RefCell $dst.Addr $dst.Negated) + '</td>')
-            [void]$sb.Append('<td>' + (YesNo (-not $disabled)) + '</td>')
-            [void]$sb.Append('<td>' + (Dash (XText $r 'descr')) + '</td>')
-            [void]$sb.Append('</tr>')
+            $src = Format-Endpoint $r.SelectSingleNode('source'); $dst = Format-Endpoint $r.SelectSingleNode('destination')
+            $extCell = (DashMono (XText $r 'external')) + $(if (XHas $r 'nobinat') { ' ' + (Badge 'DO NOT BINAT' 'warn' $true) } else { '' })
+            Add-Row $sb -Disabled $disabled -Cells @(
+                (DashMono (XText $r 'interface')), $extCell, (Format-RefCell $src.Addr $src.Negated),
+                (Format-RefCell $dst.Addr $dst.Negated), (YesNo (-not $disabled)), (Dash (XText $r 'descr'))
+            )
         }
         [void]$out.Append((Tbl @('Interface','External IP','Internal (source)','Destination','Enabled','Description') $sb.ToString() 'filterable-table'))
     }
-
     return $out.ToString()
 }
 
@@ -1758,285 +1400,135 @@ function Build-Ipsec {
     param($root)
     $ipsec = $root.SelectSingleNode('ipsec')
     if ($null -eq $ipsec) { return '' }
-    $p1 = XNodes $ipsec 'phase1'
-    $p2 = XNodes $ipsec 'phase2'
+    $p1 = XNodes $ipsec 'phase1'; $p2 = XNodes $ipsec 'phase2'
     if ($p1.Count -eq 0 -and $p2.Count -eq 0) { return '' }
-
     $out = New-Object System.Text.StringBuilder
 
-    # Phase 1
     if ($p1.Count -gt 0) {
-        [void]$out.Append('<h3>Phase 1 (IKE)</h3>')
-        $sb = New-Object System.Text.StringBuilder
-        $p1Seq = 0
+        $sb = New-Object System.Text.StringBuilder; $p1Seq = 0
         foreach ($p in $p1) {
             $p1Seq++
-            $ikeid    = XText $p 'ikeid'
-            $rowId    = 'row-ipsec-p1-' + $(if ($ikeid) { Format-Slug $ikeid } else { $p1Seq })
-            $disabled = XHas $p 'disabled'
-            $iketype  = XText $p 'iketype'
-            $mode     = XText $p 'mode'
-
-            # Inspect ALL Phase 1 encryption proposals (and legacy pre-2.4 flat nodes)
+            $ikeid = XText $p 'ikeid'; $rowId = 'row-ipsec-p1-' + $(if ($ikeid) { Format-Slug $ikeid } else { $p1Seq })
+            $disabled = XHas $p 'disabled'; $iketype = XText $p 'iketype'; $mode = XText $p 'mode'
             $items = XNodes $p 'encryption/item'
-            $encDisplays  = New-Object 'System.Collections.Generic.List[string]'
+            $proposals = if ($items.Count -gt 0) { $items } else { @($p) }
+            $encDisplays = New-Object 'System.Collections.Generic.List[string]'
             $hashDisplays = New-Object 'System.Collections.Generic.List[string]'
-            $dhDisplays   = New-Object 'System.Collections.Generic.List[string]'
-            $allCryptoVals = New-Object 'System.Collections.Generic.List[string]'
-
-            if ($items.Count -gt 0) {
-                foreach ($item in $items) {
-                    $ea = XText $item 'encryption-algorithm/name'
-                    $kl = XText $item 'encryption-algorithm/keylen'
-                    $ha = XText $item 'hash-algorithm'
-                    $dh = XText $item 'dhgroup'
-                    $ed = $ea; if ($kl) { $ed += '-' + $kl }
-                    if ($ed) { [void]$encDisplays.Add($ed); [void]$allCryptoVals.Add($ea) }
-                    if ($ha) { [void]$hashDisplays.Add($ha); [void]$allCryptoVals.Add($ha) }
-                    if ($dh) { [void]$dhDisplays.Add($dh) }
-                }
-            }
-            else {
-                $ea = XText $p 'encryption-algorithm/name'
-                $kl = XText $p 'encryption-algorithm/keylen'
-                $ha = XText $p 'hash-algorithm'
-                $dh = XText $p 'dhgroup'
-                $ed = $ea; if ($kl) { $ed += '-' + $kl }
-                if ($ed) { [void]$encDisplays.Add($ed); [void]$allCryptoVals.Add($ea) }
-                if ($ha) { [void]$hashDisplays.Add($ha); [void]$allCryptoVals.Add($ha) }
+            $dhDisplays = New-Object 'System.Collections.Generic.List[string]'
+            $cryptoVals = New-Object 'System.Collections.Generic.List[string]'
+            foreach ($prop in $proposals) {
+                $ea = XText $prop 'encryption-algorithm/name'; $kl = XText $prop 'encryption-algorithm/keylen'
+                $ha = XText $prop 'hash-algorithm'; $dh = XText $prop 'dhgroup'
+                if ($ea) { [void]$encDisplays.Add($(if ($kl) { "$ea-$kl" } else { $ea })); [void]$cryptoVals.Add($ea) }
+                if ($ha) { [void]$hashDisplays.Add($ha); [void]$cryptoVals.Add($ha) }
                 if ($dh) { [void]$dhDisplays.Add($dh) }
             }
 
-            $where = "IPsec P1 (IKE id $ikeid)"
-            $flags = New-Object System.Text.StringBuilder
+            $where = "IPsec P1 (IKE id $ikeid)"; $flags = New-Object System.Text.StringBuilder
             $rowCls = if ($disabled) { 'row-disabled' } else { '' }
-
             if (-not $disabled) {
-                $weak = Get-WeakCryptoHits $allCryptoVals.ToArray()
-                if ($weak.High.Count -gt 0) {
-                    [void]$flags.Append('<span class="badge badge-high">WEAK CRYPTO</span> ')
-                    $rowCls = 'row-high'
-                    Add-Finding 'high' 'WEAK CRYPTO' $where ('Uses ' + ($weak.High -join ', ')) $rowId
-                }
-                if ($weak.Warn.Count -gt 0) {
-                    [void]$flags.Append('<span class="badge badge-warn">LEGACY CRYPTO</span> ')
-                    if (-not $rowCls) { $rowCls = 'row-warn' }
-                    Add-Finding 'warn' 'LEGACY CRYPTO' $where ('Uses ' + ($weak.Warn -join ', ')) $rowId
-                }
-                foreach ($dhg in ($dhDisplays | Select-Object -Unique)) {
-                    $dhf = Get-WeakDhFinding $dhg $false
-                    if ($null -ne $dhf) {
-                        $bcls = if ($dhf.Sev -eq 'high') { 'badge-high' } else { 'badge-warn' }
-                        [void]$flags.Append('<span class="badge ' + $bcls + '">' + (E $dhf.Label) + '</span> ')
-                        if ($dhf.Sev -eq 'high') { $rowCls = 'row-high' } elseif (-not $rowCls) { $rowCls = 'row-warn' }
-                        Add-Finding $dhf.Sev $dhf.Label $where $dhf.Detail $rowId
-                    }
-                }
+                $rowCls = Add-CryptoFindings -CryptoValues $cryptoVals.ToArray() -DhGroups $dhDisplays.ToArray() -Where $where -RowId $rowId -Flags $flags
                 if ($iketype -match '(?i)^(ikev1|auto)$') {
-                    [void]$flags.Append('<span class="badge badge-warn">IKEV1</span> ')
+                    [void]$flags.Append((Badge 'IKEV1' 'warn' $true)).Append(' ')
                     if (-not $rowCls) { $rowCls = 'row-warn' }
                     Add-Finding 'warn' 'LEGACY IKEV1' $where ("Uses $iketype instead of IKEv2.") $rowId
                 }
                 if ($mode -ieq 'aggressive') {
-                    [void]$flags.Append('<span class="badge badge-high">AGGRESSIVE MODE</span> ')
+                    [void]$flags.Append((Badge 'AGGRESSIVE MODE' 'high' $true)).Append(' ')
                     $rowCls = 'row-high'
                     Add-Finding 'high' 'AGGRESSIVE MODE' $where 'IKEv1 Aggressive Mode exposes PSK hashes to offline cracking.' $rowId
                 }
             }
 
-            $authMethod = XText $p 'authentication_method'
-            $certRef    = XText $p 'certref'
-            $authCell   = Dash $authMethod
-            if ($certRef) { $authCell += '<br><span class="muted">Cert:</span> ' + (Format-CertRef $certRef) }
-
-            $trAttr = ' id="' + $rowId + '"'
-            if ($rowCls) { $trAttr += ' class="' + $rowCls + '"' }
-            [void]$sb.Append('<tr' + $trAttr + '>')
-            [void]$sb.Append('<td>' + (DashMono $ikeid) + '</td>')
+            $certRef = XText $p 'certref'
+            $authCell = (Dash (XText $p 'authentication_method')) + $(if ($certRef) { '<br><span class="muted">Cert:</span> ' + (Format-CertRef $certRef) } else { '' })
             $flagHtml = if ($flags.Length -gt 0) { '<div class="flagcell">' + $flags.ToString().Trim() + '</div>' } else { '' }
-            [void]$sb.Append('<td>' + (Dash (XText $p 'descr')) + $flagHtml + '</td>')
-            [void]$sb.Append('<td>' + (YesNo (-not $disabled)) + '</td>')
-            [void]$sb.Append('<td>' + (Dash $iketype) + '</td>')
-            [void]$sb.Append('<td>' + (DashMono (XText $p 'interface')) + '</td>')
-            [void]$sb.Append('<td>' + (DashMono (XText $p 'remote-gateway')) + '</td>')
-            [void]$sb.Append('<td>' + (DashMono (($encDisplays | Select-Object -Unique) -join ', ')) + '</td>')
-            [void]$sb.Append('<td>' + (DashMono (($hashDisplays | Select-Object -Unique) -join ', ')) + '</td>')
-            [void]$sb.Append('<td>' + (DashMono (($dhDisplays | Select-Object -Unique) -join ', ')) + '</td>')
-            [void]$sb.Append('<td>' + (DashMono (XText $p 'lifetime')) + '</td>')
-            [void]$sb.Append('<td>' + $authCell + '</td>')
-            [void]$sb.Append('<td>' + (Secret (XText $p 'pre-shared-key')) + '</td>')
-            [void]$sb.Append('</tr>')
+            Add-Row $sb -Id $rowId -Class $rowCls -Disabled $disabled -Cells @(
+                (DashMono $ikeid), ((Dash (XText $p 'descr')) + $flagHtml), (YesNo (-not $disabled)), (Dash $iketype),
+                (DashMono (XText $p 'interface')), (DashMono (XText $p 'remote-gateway')),
+                (DashMono (($encDisplays | Select-Object -Unique) -join ', ')), (DashMono (($hashDisplays | Select-Object -Unique) -join ', ')),
+                (DashMono (($dhDisplays | Select-Object -Unique) -join ', ')), (DashMono (XText $p 'lifetime')),
+                $authCell, (Secret (XText $p 'pre-shared-key'))
+            )
         }
-        [void]$out.Append((Tbl @('IKE id','Description','Enabled','IKE','Interface','Peer / Remote GW','Encryption','Hash','DH group','Lifetime','Auth','Pre-shared key') $sb.ToString()))
+        [void]$out.Append('<h3>Phase 1 (IKE)</h3>').Append((Tbl @('IKE id','Description','Enabled','IKE','Interface','Peer / Remote GW','Encryption','Hash','DH group','Lifetime','Auth','Pre-shared key') $sb.ToString()))
     }
 
-    # Phase 2
     if ($p2.Count -gt 0) {
-        [void]$out.Append('<h3>Phase 2 (IPsec SA)</h3>')
-        $sb = New-Object System.Text.StringBuilder
-        $p2Seq = 0
+        $sb = New-Object System.Text.StringBuilder; $p2Seq = 0
         foreach ($p in $p2) {
-            $p2Seq++
-            $ikeid    = XText $p 'ikeid'
-            $rowId    = 'row-ipsec-p2-' + $p2Seq
-            $disabled = XHas $p 'disabled'
-            $lid = $p.SelectSingleNode('localid')
-            $local = XText $lid 'type'
-            if (XText $lid 'address') { $local = (XText $lid 'address'); $nb = XText $lid 'netbits'; if ($nb) { $local += '/' + $nb } }
-            $rid = $p.SelectSingleNode('remoteid')
-            $remote = XText $rid 'type'
-            if (XText $rid 'address') { $remote = (XText $rid 'address'); $nb = XText $rid 'netbits'; if ($nb) { $remote += '/' + $nb } }
+            $p2Seq++; $ikeid = XText $p 'ikeid'; $rowId = "row-ipsec-p2-$p2Seq"; $disabled = XHas $p 'disabled'
+            $lid = $p.SelectSingleNode('localid'); $rid = $p.SelectSingleNode('remoteid')
+            $local  = if (XText $lid 'address') { (XText $lid 'address') + $(if (XText $lid 'netbits') { '/' + (XText $lid 'netbits') } else { '' }) } else { XText $lid 'type' }
+            $remote = if (XText $rid 'address') { (XText $rid 'address') + $(if (XText $rid 'netbits') { '/' + (XText $rid 'netbits') } else { '' }) } else { XText $rid 'type' }
 
-            $encList  = New-Object 'System.Collections.Generic.List[string]'
+            $encList = New-Object 'System.Collections.Generic.List[string]'
             $encNames = New-Object 'System.Collections.Generic.List[string]'
             foreach ($e in (XNodes $p 'encryption-algorithm-option')) {
                 $n = XText $e 'name'; $kl = XText $e 'keylen'
-                if ($n) { [void]$encNames.Add($n) }
-                $d = $n; if ($kl) { $d += '-' + $kl }
-                if ($d) { [void]$encList.Add($d) }
+                if ($n) { [void]$encNames.Add($n); [void]$encList.Add($(if ($kl) { "$n-$kl" } else { $n })) }
             }
-            $hashList = New-Object 'System.Collections.Generic.List[string]'
-            foreach ($h in (XNodes $p 'hash-algorithm-option')) {
-                $hv = $h.InnerText.Trim()
-                if ($hv) { [void]$hashList.Add($hv) }
-            }
+            $hashList = @(foreach ($h in (XNodes $p 'hash-algorithm-option')) { if ($h.InnerText.Trim()) { $h.InnerText.Trim() } })
             $pfs = XText $p 'pfsgroup'
 
-            $where = "IPsec P2 (IKE id $ikeid)"
             $flags = New-Object System.Text.StringBuilder
             $rowCls = if ($disabled) { 'row-disabled' } else { '' }
             if (-not $disabled) {
-                $allVals = @($encNames.ToArray()) + @($hashList.ToArray())
-                $weak = Get-WeakCryptoHits $allVals
-                if ($weak.High.Count -gt 0) {
-                    [void]$flags.Append('<span class="badge badge-high">WEAK CRYPTO</span> ')
-                    $rowCls = 'row-high'
-                    Add-Finding 'high' 'WEAK CRYPTO' $where ('Uses ' + ($weak.High -join ', ')) $rowId
-                }
-                if ($weak.Warn.Count -gt 0) {
-                    [void]$flags.Append('<span class="badge badge-warn">LEGACY CRYPTO</span> ')
-                    if (-not $rowCls) { $rowCls = 'row-warn' }
-                    Add-Finding 'warn' 'LEGACY CRYPTO' $where ('Uses ' + ($weak.Warn -join ', ')) $rowId
-                }
-                $pfsf = Get-WeakDhFinding $pfs $true
-                if ($null -ne $pfsf) {
-                    $bcls = if ($pfsf.Sev -eq 'high') { 'badge-high' } else { 'badge-warn' }
-                    [void]$flags.Append('<span class="badge ' + $bcls + '">' + (E $pfsf.Label) + '</span> ')
-                    if ($pfsf.Sev -eq 'high') { $rowCls = 'row-high' } elseif (-not $rowCls) { $rowCls = 'row-warn' }
-                    Add-Finding $pfsf.Sev $pfsf.Label $where $pfsf.Detail $rowId
-                }
+                $rowCls = Add-CryptoFindings -CryptoValues (@($encNames.ToArray()) + $hashList) -DhGroups @($pfs) -IsPfs $true -Where "IPsec P2 (IKE id $ikeid)" -RowId $rowId -Flags $flags
             }
-
-            $trAttr = ' id="' + $rowId + '"'
-            if ($rowCls) { $trAttr += ' class="' + $rowCls + '"' }
-            [void]$sb.Append('<tr' + $trAttr + '>')
-            [void]$sb.Append('<td>' + (DashMono $ikeid) + '</td>')
             $flagHtml = if ($flags.Length -gt 0) { '<div class="flagcell">' + $flags.ToString().Trim() + '</div>' } else { '' }
-            [void]$sb.Append('<td>' + (Dash (XText $p 'descr')) + $flagHtml + '</td>')
-            [void]$sb.Append('<td>' + (YesNo (-not $disabled)) + '</td>')
-            [void]$sb.Append('<td>' + (Dash (XText $p 'mode')) + '</td>')
-            [void]$sb.Append('<td>' + (DashMono (XText $p 'protocol')) + '</td>')
-            [void]$sb.Append('<td>' + (DashMono $local) + '</td>')
-            [void]$sb.Append('<td>' + (DashMono $remote) + '</td>')
-            [void]$sb.Append('<td>' + (DashMono ($encList -join ', ')) + '</td>')
-            [void]$sb.Append('<td>' + (DashMono ($hashList -join ', ')) + '</td>')
-            [void]$sb.Append('<td>' + (DashMono $pfs) + '</td>')
-            [void]$sb.Append('<td>' + (DashMono (XText $p 'lifetime')) + '</td>')
-            [void]$sb.Append('</tr>')
+            Add-Row $sb -Id $rowId -Class $rowCls -Disabled $disabled -Cells @(
+                (DashMono $ikeid), ((Dash (XText $p 'descr')) + $flagHtml), (YesNo (-not $disabled)), (Dash (XText $p 'mode')),
+                (DashMono (XText $p 'protocol')), (DashMono $local), (DashMono $remote),
+                (DashMono ($encList -join ', ')), (DashMono ($hashList -join ', ')), (DashMono $pfs), (DashMono (XText $p 'lifetime'))
+            )
         }
-        [void]$out.Append((Tbl @('IKE id','Description','Enabled','Mode','Protocol','Local network','Remote network','Encryption','Hash','PFS group','Lifetime') $sb.ToString()))
+        [void]$out.Append('<h3>Phase 2 (IPsec SA)</h3>').Append((Tbl @('IKE id','Description','Enabled','Mode','Protocol','Local network','Remote network','Encryption','Hash','PFS group','Lifetime') $sb.ToString()))
     }
-
     return $out.ToString()
 }
 
 function Format-OpenVpnRows {
     param($list, [bool]$isServer)
-    $sb = New-Object System.Text.StringBuilder
-    $seq = 0
+    $sb = New-Object System.Text.StringBuilder; $seq = 0
+    $kind = if ($isServer) { 'server' } else { 'client' }
     foreach ($s in $list) {
-        $seq++
-        $kind     = if ($isServer) { 'server' } else { 'client' }
-        $rowId    = "row-ovpn-$kind-$seq"
+        $seq++; $rowId = "row-ovpn-$kind-$seq"
         $disabled = (XHas $s 'disable') -or (XHas $s 'disabled')
-        $desc     = XText $s 'description'
-        $mode     = XText $s 'mode'
-        $devMode  = XText $s 'dev_mode'
-        $proto    = XText $s 'protocol'
-        $endpoint = ''
-        if ($isServer) {
-            $endpoint = XText $s 'local_port'
+        $desc = XText $s 'description'; $mode = XText $s 'mode'; $devMode = XText $s 'dev_mode'
+        $endpoint = if ($isServer) { XText $s 'local_port' } else {
+            $sa = XText $s 'server_addr'; $sp = XText $s 'server_port'
+            if ($sa -and $sp) { "$sa`:$sp" } elseif ($sa) { $sa } elseif ($sp) { ":$sp" } else { '' }
         }
-        else {
-            $sa = XText $s 'server_addr'
-            $sp = XText $s 'server_port'
-            if ($sa -and $sp) { $endpoint = $sa + ':' + $sp }
-            elseif ($sa) { $endpoint = $sa }
-            elseif ($sp) { $endpoint = ':' + $sp }
-        }
-        $tnet   = XText $s 'tunnel_network'
-        $lnet   = XText $s 'local_network'
-        $rnet   = XText $s 'remote_network'
-        $auth   = XText $s 'authmode'
-        $dc     = XText $s 'data_ciphers'
-        $dcf    = XText $s 'data_ciphers_fallback'
-        $legacy = XText $s 'crypto'
-        $digest = XText $s 'digest'
-        $comp   = XText $s 'compression'
-        $tlsUse = if (XText $s 'tls') { $tm = XText $s 'tls_type'; if ($tm) { $tm } else { 'tls-auth' } } else { '' }
-        $cipherDisp = $dc
-        if (-not $cipherDisp -and $legacy) { $cipherDisp = $legacy }
-        if ($dcf) {
-            if ($cipherDisp) { $cipherDisp += ' (fallback ' + $dcf + ')' } else { $cipherDisp = $dcf }
-        }
-        $caref   = XText $s 'caref'
-        $certref = XText $s 'certref'
+        $dc = XText $s 'data_ciphers'; $dcf = XText $s 'data_ciphers_fallback'; $legacy = XText $s 'crypto'; $digest = XText $s 'digest'; $comp = XText $s 'compression'
+        $cipherDisp = if ($dc) { $dc } else { $legacy }
+        if ($dcf) { $cipherDisp = if ($cipherDisp) { "$cipherDisp (fallback $dcf)" } else { $dcf } }
 
         $where = "OpenVPN $kind '" + $(if ($desc) { $desc } else { '(unnamed)' }) + "'"
         $flags = New-Object System.Text.StringBuilder
         $rowCls = if ($disabled) { 'row-disabled' } else { '' }
-        if ($tlsUse) { [void]$flags.Append('<span class="badge badge-info">' + (E $tlsUse.ToUpperInvariant()) + '</span> ') }
-
+        if (XText $s 'tls') {
+            $tm = XText $s 'tls_type'; if (-not $tm) { $tm = 'tls-auth' }
+            [void]$flags.Append((Badge $tm.ToUpperInvariant() 'info')).Append(' ')
+        }
         if (-not $disabled) {
-            $weak = Get-WeakCryptoHits @($dc, $dcf, $legacy, $digest)
-            if ($weak.High.Count -gt 0) {
-                [void]$flags.Append('<span class="badge badge-high">WEAK CRYPTO</span> ')
-                $rowCls = 'row-high'
-                Add-Finding 'high' 'WEAK CRYPTO' $where ('Uses ' + ($weak.High -join ', ')) $rowId
-            }
-            if ($weak.Warn.Count -gt 0) {
-                [void]$flags.Append('<span class="badge badge-warn">LEGACY CRYPTO</span> ')
-                if (-not $rowCls) { $rowCls = 'row-warn' }
-                Add-Finding 'warn' 'LEGACY CRYPTO' $where ('Uses ' + ($weak.Warn -join ', ')) $rowId
-            }
+            $rowCls = Add-CryptoFindings -CryptoValues @($dc, $dcf, $legacy, $digest) -Where $where -RowId $rowId -Flags $flags
             if ($comp -and $comp -notmatch '(?i)^(no|none|stub)$') {
-                [void]$flags.Append('<span class="badge badge-warn">COMPRESSION</span> ')
+                [void]$flags.Append((Badge 'COMPRESSION' 'warn' $true)).Append(' ')
                 if (-not $rowCls) { $rowCls = 'row-warn' }
                 Add-Finding 'warn' 'VPN COMPRESSION' $where ("Compression '$comp' is enabled (potential VORACLE side-channel risk).") $rowId
             }
         }
 
-        $trAttr = ' id="' + $rowId + '"'
-        if ($rowCls) { $trAttr += ' class="' + $rowCls + '"' }
-        $caCell = Format-CertRef $caref
-        if ($certref) { $caCell += '<br><span class="muted">Cert:</span> ' + (Format-CertRef $certref) }
-        $modeDisp = if ($devMode) { "$mode ($devMode)" } else { $mode }
-
-        [void]$sb.Append('<tr' + $trAttr + '>')
+        $certref = XText $s 'certref'
+        $caCell = (Format-CertRef (XText $s 'caref')) + $(if ($certref) { '<br><span class="muted">Cert:</span> ' + (Format-CertRef $certref) } else { '' })
         $flagHtml = if ($flags.Length -gt 0) { '<div class="flagcell">' + $flags.ToString().Trim() + '</div>' } else { '' }
-        [void]$sb.Append('<td>' + (Dash $desc) + $flagHtml + '</td>')
-        [void]$sb.Append('<td>' + (YesNo (-not $disabled)) + '</td>')
-        [void]$sb.Append('<td>' + (Dash $modeDisp) + '</td>')
-        [void]$sb.Append('<td>' + (DashMono $proto) + '</td>')
-        [void]$sb.Append('<td>' + (DashMono $endpoint) + '</td>')
-        [void]$sb.Append('<td>' + (DashMono $tnet) + '</td>')
-        [void]$sb.Append('<td>' + (DashMono $lnet) + '</td>')
-        [void]$sb.Append('<td>' + (DashMono $rnet) + '</td>')
-        [void]$sb.Append('<td>' + (Dash $auth) + '</td>')
-        [void]$sb.Append('<td>' + (DashMono $cipherDisp) + '</td>')
-        [void]$sb.Append('<td>' + (DashMono $digest) + '</td>')
-        [void]$sb.Append('<td>' + $caCell + '</td>')
-        [void]$sb.Append('</tr>')
+        Add-Row $sb -Id $rowId -Class $rowCls -Disabled $disabled -Cells @(
+            ((Dash $desc) + $flagHtml), (YesNo (-not $disabled)), (Dash $(if ($devMode) { "$mode ($devMode)" } else { $mode })),
+            (DashMono (XText $s 'protocol')), (DashMono $endpoint), (DashMono (XText $s 'tunnel_network')),
+            (DashMono (XText $s 'local_network')), (DashMono (XText $s 'remote_network')),
+            (Dash (XText $s 'authmode')), (DashMono $cipherDisp), (DashMono $digest), $caCell
+        )
     }
     return $sb.ToString()
 }
@@ -2045,18 +1537,14 @@ function Build-OpenVpn {
     param($root)
     $ovpn = $root.SelectSingleNode('openvpn')
     if ($null -eq $ovpn) { return '' }
-    $servers = XNodes $ovpn 'openvpn-server'
-    $clients = XNodes $ovpn 'openvpn-client'
+    $servers = XNodes $ovpn 'openvpn-server'; $clients = XNodes $ovpn 'openvpn-client'
     if ($servers.Count -eq 0 -and $clients.Count -eq 0) { return '' }
-
     $out = New-Object System.Text.StringBuilder
     if ($servers.Count -gt 0) {
-        [void]$out.Append('<h3>OpenVPN Servers</h3>')
-        [void]$out.Append((Tbl @('Description','Enabled','Mode','Protocol','Port','Tunnel network','Local network','Remote network','Auth','Cipher','Digest','CA / Cert') (Format-OpenVpnRows $servers $true)))
+        [void]$out.Append('<h3>OpenVPN Servers</h3>').Append((Tbl @('Description','Enabled','Mode','Protocol','Port','Tunnel network','Local network','Remote network','Auth','Cipher','Digest','CA / Cert') (Format-OpenVpnRows $servers $true)))
     }
     if ($clients.Count -gt 0) {
-        [void]$out.Append('<h3>OpenVPN Clients</h3>')
-        [void]$out.Append((Tbl @('Description','Enabled','Mode','Protocol','Server','Tunnel network','Local network','Remote network','Auth','Cipher','Digest','CA / Cert') (Format-OpenVpnRows $clients $false)))
+        [void]$out.Append('<h3>OpenVPN Clients</h3>').Append((Tbl @('Description','Enabled','Mode','Protocol','Server','Tunnel network','Local network','Remote network','Auth','Cipher','Digest','CA / Cert') (Format-OpenVpnRows $clients $false)))
     }
     [void]$out.Append('<p class="note">OpenVPN TLS static keys are never exported by this report, regardless of options.</p>')
     return $out.ToString()
@@ -2067,57 +1555,37 @@ function Build-WireGuard {
     $wg = $root.SelectSingleNode('installedpackages/wireguard')
     if ($null -eq $wg) { $wg = $root.SelectSingleNode('wireguard') }
     if ($null -eq $wg) { return '' }
-    $tunnels = XNodes $wg 'tunnels/item'
-    $peers   = XNodes $wg 'peers/item'
+    $tunnels = XNodes $wg 'tunnels/item'; $peers = XNodes $wg 'peers/item'
     if ($tunnels.Count -eq 0 -and $peers.Count -eq 0) { return '' }
 
     $out = New-Object System.Text.StringBuilder
     if ($tunnels.Count -gt 0) {
         $sb = New-Object System.Text.StringBuilder
         foreach ($t in $tunnels) {
-            $en = (XText $t 'enabled') -match '(?i)^(yes|on|enabled|true|1)$'
-            $addrs = New-Object 'System.Collections.Generic.List[string]'
-            foreach ($a in (XNodes $t 'addresses/row')) {
-                $ad = XText $a 'address'; $mk = XText $a 'mask'
-                if ($ad) { [void]$addrs.Add($(if ($mk) { "$ad/$mk" } else { $ad })) }
-            }
-            $cls = if (-not $en) { ' class="row-disabled"' } else { '' }
-            [void]$sb.Append('<tr' + $cls + '>')
-            [void]$sb.Append('<td>' + (DashMono (XText $t 'name')) + '</td>')
-            [void]$sb.Append('<td>' + (YesNo $en) + '</td>')
-            [void]$sb.Append('<td>' + (DashMono (XText $t 'listenport')) + '</td>')
-            [void]$sb.Append('<td>' + $(if ($addrs.Count) { ($addrs | ForEach-Object { DashMono $_ }) -join '<br>' } else { '<span class="muted">&mdash;</span>' }) + '</td>')
-            [void]$sb.Append('<td>' + (Dash (XText $t 'descr')) + '</td>')
-            [void]$sb.Append('</tr>')
+            $en = Test-XmlEnabled $t @('enabled')
+            $addrs = @(foreach ($a in (XNodes $t 'addresses/row')) {
+                $ad = XText $a 'address'; $mk = XText $a 'mask'; if ($ad) { if ($mk) { "$ad/$mk" } else { $ad } }
+            })
+            Add-Row $sb -Disabled (-not $en) -Cells @(
+                (DashMono (XText $t 'name')), (YesNo $en), (DashMono (XText $t 'listenport')), (Format-ListCell $addrs -Mode 'mono'), (Dash (XText $t 'descr'))
+            )
         }
-        [void]$out.Append('<h3>WireGuard Tunnels</h3>')
-        [void]$out.Append((Tbl @('Tunnel','Enabled','Listen Port','Addresses','Description') $sb.ToString()))
+        [void]$out.Append('<h3>WireGuard Tunnels</h3>').Append((Tbl @('Tunnel','Enabled','Listen Port','Addresses','Description') $sb.ToString()))
     }
     if ($peers.Count -gt 0) {
         $sb = New-Object System.Text.StringBuilder
         foreach ($p in $peers) {
-            $en = (XText $p 'enabled') -match '(?i)^(yes|on|enabled|true|1)$'
-            $ep = XText $p 'endpoint'
-            $pt = XText $p 'port'
-            if ($ep -and $pt) { $ep = $ep + ':' + $pt }
-            $allowed = New-Object 'System.Collections.Generic.List[string]'
-            foreach ($a in (XNodes $p 'allowedips/row')) {
-                $ad = XText $a 'address'; $mk = XText $a 'mask'
-                if ($ad) { [void]$allowed.Add($(if ($mk) { "$ad/$mk" } else { $ad })) }
-            }
-            $hasPsk = -not [string]::IsNullOrWhiteSpace((XText $p 'presharedkey'))
-            $cls = if (-not $en) { ' class="row-disabled"' } else { '' }
-            [void]$sb.Append('<tr' + $cls + '>')
-            [void]$sb.Append('<td>' + (DashMono (XText $p 'tun')) + '</td>')
-            [void]$sb.Append('<td>' + (YesNo $en) + '</td>')
-            [void]$sb.Append('<td>' + (DashMono $ep) + '</td>')
-            [void]$sb.Append('<td>' + $(if ($allowed.Count) { ($allowed | ForEach-Object { DashMono $_ }) -join '<br>' } else { '<span class="muted">&mdash;</span>' }) + '</td>')
-            [void]$sb.Append('<td>' + (YesNo $hasPsk) + '</td>')
-            [void]$sb.Append('<td>' + (Dash (XText $p 'descr')) + '</td>')
-            [void]$sb.Append('</tr>')
+            $en = Test-XmlEnabled $p @('enabled')
+            $ep = XText $p 'endpoint'; $pt = XText $p 'port'; if ($ep -and $pt) { $ep = "$ep`:$pt" }
+            $allowed = @(foreach ($a in (XNodes $p 'allowedips/row')) {
+                $ad = XText $a 'address'; $mk = XText $a 'mask'; if ($ad) { if ($mk) { "$ad/$mk" } else { $ad } }
+            })
+            Add-Row $sb -Disabled (-not $en) -Cells @(
+                (DashMono (XText $p 'tun')), (YesNo $en), (DashMono $ep), (Format-ListCell $allowed -Mode 'mono'),
+                (YesNo (-not [string]::IsNullOrWhiteSpace((XText $p 'presharedkey')))), (Dash (XText $p 'descr'))
+            )
         }
-        [void]$out.Append('<h3>WireGuard Peers</h3>')
-        [void]$out.Append((Tbl @('Tunnel','Enabled','Endpoint','Allowed IPs','PSK Set','Description') $sb.ToString()))
+        [void]$out.Append('<h3>WireGuard Peers</h3>').Append((Tbl @('Tunnel','Enabled','Endpoint','Allowed IPs','PSK Set','Description') $sb.ToString()))
     }
     [void]$out.Append('<p class="note">WireGuard private keys and preshared keys are never exported by this report, regardless of options.</p>')
     return $out.ToString()
@@ -2127,166 +1595,135 @@ function Build-HighAvailability {
     param($root)
     $ha = $root.SelectSingleNode('hasync')
     if ($null -eq $ha) { return '' }
-    $pfsync  = XHas $ha 'pfsyncenabled'
-    $pfIf    = XText $ha 'pfsyncinterface'
-    $pfPeer  = XText $ha 'pfsyncpeerip'
-    $syncTo  = XText $ha 'synchronizetoip'
-    $syncUsr = XText $ha 'username'
+    $pfsync = XHas $ha 'pfsyncenabled'; $pfIf = XText $ha 'pfsyncinterface'; $syncTo = XText $ha 'synchronizetoip'
     if (-not $pfsync -and -not $syncTo -and -not $pfIf) { return '' }
-
-    $synced = New-Object 'System.Collections.Generic.List[string]'
-    foreach ($child in $ha.ChildNodes) {
-        if ($child.NodeType -eq [System.Xml.XmlNodeType]::Element -and $child.Name -like 'synchronize*') {
-            if ($child.Name -notin @('synchronizetoip')) {
-                [void]$synced.Add(($child.Name -replace '^synchronize', ''))
-            }
+    $synced = @(foreach ($child in $ha.ChildNodes) {
+        if ($child.NodeType -eq [System.Xml.XmlNodeType]::Element -and $child.Name -like 'synchronize*' -and $child.Name -ne 'synchronizetoip') {
+            $child.Name -replace '^synchronize', ''
         }
-    }
-
-    $sb = New-Object System.Text.StringBuilder
-    [void]$sb.Append('<div class="table-wrap"><table class="kv">')
-    [void]$sb.Append('<tr><th>pfsync State Sync</th><td>' + (YesNo $pfsync) + '</td></tr>')
-    [void]$sb.Append('<tr><th>pfsync Interface</th><td>' + (DashMono $pfIf) + '</td></tr>')
-    [void]$sb.Append('<tr><th>pfsync Peer IP</th><td>' + (DashMono $pfPeer) + '</td></tr>')
-    [void]$sb.Append('<tr><th>XMLRPC Sync Target IP</th><td>' + (DashMono $syncTo) + '</td></tr>')
-    [void]$sb.Append('<tr><th>XMLRPC Username</th><td>' + (E-User $syncUsr) + '</td></tr>')
-    [void]$sb.Append('<tr><th>XMLRPC Password</th><td><span class="muted">' + $(if (XText $ha 'password') { '[password not shown]' } else { '[none]' }) + '</span></td></tr>')
-    [void]$sb.Append('<tr><th>Synced Sections</th><td>' + $(if ($synced.Count) { E ($synced -join ', ') } else { '<span class="muted">&mdash;</span>' }) + '</td></tr>')
-    [void]$sb.Append('</table></div>')
-    return $sb.ToString()
+    })
+    return (Format-KvTable @(
+        @('pfsync State Sync',     (YesNo $pfsync)),
+        @('pfsync Interface',      (DashMono $pfIf)),
+        @('pfsync Peer IP',        (DashMono (XText $ha 'pfsyncpeerip'))),
+        @('XMLRPC Sync Target IP', (DashMono $syncTo)),
+        @('XMLRPC Username',       (E-User (XText $ha 'username'))),
+        @('XMLRPC Password',       ('<span class="muted">' + $(if (XText $ha 'password') { '[password not shown]' } else { '[none]' }) + '</span>')),
+        @('Synced Sections',       (Format-ListCell $synced -Separator ', '))
+    ))
 }
 
 function Build-Dhcp {
     param($root)
-    $out = New-Object System.Text.StringBuilder
-    $any = $false
-
+    $out = New-Object System.Text.StringBuilder; $any = $false
     foreach ($spec in @(@{ Tag = 'dhcpd'; Label = 'DHCPv4' }, @{ Tag = 'dhcpdv6'; Label = 'DHCPv6' })) {
         $node = $root.SelectSingleNode($spec.Tag)
         if ($null -eq $node) { continue }
         foreach ($ifNode in $node.ChildNodes) {
             if ($ifNode.NodeType -ne [System.Xml.XmlNodeType]::Element) { continue }
-            $any = $true
-            $key     = $ifNode.Name
-            $friendly = if ($script:IfMap.ContainsKey($key)) { $key + ' &mdash; ' + $script:IfMap[$key] } else { $key }
-            $enabled = XHas $ifNode 'enable'
-            $from    = XText $ifNode 'range/from'
-            $to      = XText $ifNode 'range/to'
-            $ranges  = New-Object 'System.Collections.Generic.List[string]'
+            $any = $true; $key = $ifNode.Name
+            $friendly = if ($script:IfMap.ContainsKey($key)) { "$key &mdash; $($script:IfMap[$key])" } else { $key }
+            $ranges = New-Object 'System.Collections.Generic.List[string]'
+            $from = XText $ifNode 'range/from'; $to = XText $ifNode 'range/to'
             if ($from -or $to) { [void]$ranges.Add("$from - $to") }
             foreach ($pool in (XNodes $ifNode 'pool')) {
                 $pf = XText $pool 'range/from'; $pt = XText $pool 'range/to'
                 if ($pf -or $pt) { [void]$ranges.Add("$pf - $pt (pool)") }
             }
-            $dns = New-Object 'System.Collections.Generic.List[string]'
-            foreach ($d in (XNodes $ifNode 'dnsserver')) { if ($d.InnerText.Trim()) { [void]$dns.Add($d.InnerText.Trim()) } }
-            $gw  = XText $ifNode 'gateway'
-            $dom = XText $ifNode 'domain'
-            $dlt = XText $ifNode 'defaultleasetime'
-            $mlt = XText $ifNode 'maxleasetime'
-            $denyUnk = XHas $ifNode 'denyunknown'
-
-            $kv = New-Object System.Text.StringBuilder
-            [void]$kv.Append('<table class="kv">')
-            [void]$kv.Append('<tr><th>Enabled</th><td>' + (YesNo $enabled) + '</td></tr>')
-            [void]$kv.Append('<tr><th>Pool range(s)</th><td>' + $(if ($ranges.Count) { ($ranges | ForEach-Object { DashMono $_ }) -join '<br>' } else { '<span class="muted">&mdash;</span>' }) + '</td></tr>')
-            [void]$kv.Append('<tr><th>DNS servers</th><td>' + $(if ($dns.Count) { ($dns | ForEach-Object { DashMono $_ }) -join '<br>' } else { '<span class="muted">&mdash;</span>' }) + '</td></tr>')
-            [void]$kv.Append('<tr><th>Gateway</th><td>' + (DashMono $gw) + '</td></tr>')
-            [void]$kv.Append('<tr><th>Domain</th><td>' + (Dash $dom) + '</td></tr>')
-            [void]$kv.Append('<tr><th>Deny unknown clients</th><td>' + (YesNo $denyUnk) + '</td></tr>')
-            [void]$kv.Append('<tr><th>Default / Max lease</th><td>' + (DashMono $(if ($dlt -or $mlt) { "$dlt / $mlt" } else { '' })) + '</td></tr>')
-            [void]$kv.Append('</table>')
-
-            [void]$out.Append('<h3 class="iface-head">' + (E $friendly) + ' <span class="badge badge-info">' + $spec.Label + '</span></h3><div class="table-wrap">' + $kv.ToString() + '</div>')
+            $dns = @(foreach ($d in (XNodes $ifNode 'dnsserver')) { $d.InnerText.Trim() })
+            $dlt = XText $ifNode 'defaultleasetime'; $mlt = XText $ifNode 'maxleasetime'
+            $kvHtml = Format-KvTable @(
+                @('Enabled',              (YesNo (XHas $ifNode 'enable'))),
+                @('Pool range(s)',        (Format-ListCell $ranges.ToArray() -Mode 'mono')),
+                @('DNS servers',          (Format-ListCell $dns -Mode 'mono')),
+                @('Gateway',              (DashMono (XText $ifNode 'gateway'))),
+                @('Domain',               (Dash (XText $ifNode 'domain'))),
+                @('Deny unknown clients', (YesNo (XHas $ifNode 'denyunknown'))),
+                @('Default / Max lease',  (DashMono $(if ($dlt -or $mlt) { "$dlt / $mlt" } else { '' })))
+            )
+            [void]$out.Append('<h3 class="iface-head">' + (E $friendly) + ' ' + (Badge $spec.Label 'info' $true) + '</h3>' + $kvHtml)
 
             $smaps = XNodes $ifNode 'staticmap'
             if ($smaps.Count -gt 0) {
                 $sb = New-Object System.Text.StringBuilder
+                $isV6 = ($spec.Tag -eq 'dhcpdv6')
                 foreach ($m in $smaps) {
-                    $idVal = if ($spec.Tag -eq 'dhcpdv6') { XText $m 'duid' } else { XText $m 'mac' }
-                    $ipVal = if ($spec.Tag -eq 'dhcpdv6') { XText $m 'ipaddrv6' } else { XText $m 'ipaddr' }
-                    [void]$sb.Append('<tr>')
-                    [void]$sb.Append('<td>' + (DashMono $idVal) + '</td>')
-                    [void]$sb.Append('<td>' + (DashMono $ipVal) + '</td>')
-                    [void]$sb.Append('<td>' + (E-Host (XText $m 'hostname')) + '</td>')
-                    [void]$sb.Append('<td>' + (DashMono (XText $m 'cid')) + '</td>')
-                    [void]$sb.Append('<td>' + (Dash (XText $m 'descr')) + '</td>')
-                    [void]$sb.Append('</tr>')
+                    Add-Row $sb @(
+                        (DashMono (XText $m $(if ($isV6) { 'duid' } else { 'mac' }))),
+                        (DashMono (XText $m $(if ($isV6) { 'ipaddrv6' } else { 'ipaddr' }))),
+                        (E-Host (XText $m 'hostname')), (DashMono (XText $m 'cid')), (Dash (XText $m 'descr'))
+                    )
                 }
-                $idHdr = if ($spec.Tag -eq 'dhcpdv6') { 'DUID' } else { 'MAC' }
+                $idHdr = if ($isV6) { 'DUID' } else { 'MAC' }
                 [void]$out.Append('<p class="subtitle">Static mappings (' + $smaps.Count + ')</p>' + (Tbl @($idHdr,'IP address','Hostname','Client ID','Description') $sb.ToString() 'filterable-table'))
             }
         }
     }
-
-    # DHCP Relay (v4 & v6)
     foreach ($rSpec in @(@{ Tag = 'dhcrelay'; Label = 'DHCPv4 Relay' }, @{ Tag = 'dhcrelay6'; Label = 'DHCPv6 Relay' })) {
         $rel = $root.SelectSingleNode($rSpec.Tag)
         if ($null -ne $rel -and (XHas $rel 'enable')) {
             $any = $true
-            $kv = '<table class="kv">' +
-                  '<tr><th>Enabled</th><td>' + (YesNo $true) + '</td></tr>' +
-                  '<tr><th>Interfaces</th><td>' + (DashMono (XText $rel 'interface')) + '</td></tr>' +
-                  '<tr><th>Destination Server(s)</th><td>' + (DashMono (XText $rel 'server')) + '</td></tr>' +
-                  '</table>'
-            [void]$out.Append('<h3>' + $rSpec.Label + '</h3><div class="table-wrap">' + $kv + '</div>')
+            [void]$out.Append('<h3>' + $rSpec.Label + '</h3>' + (Format-KvTable @(
+                @('Enabled', (YesNo $true)), @('Interfaces', (DashMono (XText $rel 'interface'))), @('Destination Server(s)', (DashMono (XText $rel 'server')))
+            )))
         }
     }
-
     if (-not $any) { return '' }
+    return $out.ToString()
+}
+
+function Build-DnsOverrides {
+    param($parentNode, [bool]$IncludeAliases = $false)
+    $out = New-Object System.Text.StringBuilder
+    $hosts = XNodes $parentNode 'hosts'
+    if ($hosts.Count -gt 0) {
+        $sb = New-Object System.Text.StringBuilder
+        foreach ($h in $hosts) {
+            if ($IncludeAliases) {
+                $alItems = @(foreach ($al in (XNodes $h 'aliases/item')) {
+                    $ah = XText $al 'host'; $ad = XText $al 'domain'
+                    if ($ah -and $ad) { "$ah.$ad" } elseif ($ah) { $ah }
+                })
+                Add-Row $sb @((E-Host (XText $h 'host')), (Dash (XText $h 'domain')), (DashMono (XText $h 'ip')), (Format-ListCell $alItems -Mode 'host'), (Dash (XText $h 'descr')))
+            }
+            else {
+                Add-Row $sb @((E-Host (XText $h 'host')), (Dash (XText $h 'domain')), (DashMono (XText $h 'ip')), (Dash (XText $h 'descr')))
+            }
+        }
+        $hdrs = if ($IncludeAliases) { @('Host','Domain','IP','Aliases','Description') } else { @('Host','Domain','IP','Description') }
+        [void]$out.Append('<p class="subtitle">Host overrides (' + $hosts.Count + ')</p>' + (Tbl $hdrs $sb.ToString() 'filterable-table'))
+    }
+    $doms = XNodes $parentNode 'domainoverrides'
+    if ($doms.Count -gt 0) {
+        $sb = New-Object System.Text.StringBuilder
+        foreach ($d in $doms) { Add-Row $sb @((Dash (XText $d 'domain')), (DashMono (XText $d 'ip')), (Dash (XText $d 'descr'))) }
+        [void]$out.Append('<p class="subtitle">Domain overrides (' + $doms.Count + ')</p>' + (Tbl @('Domain','Forward-to IP','Description') $sb.ToString() 'filterable-table'))
+    }
     return $out.ToString()
 }
 
 function Build-Dns {
     param($root)
     $out = New-Object System.Text.StringBuilder
-
-    # Resolver (Unbound)
     $unbound = $root.SelectSingleNode('unbound')
     [void]$out.Append('<h3>DNS Resolver (Unbound)</h3>')
     if ($null -eq $unbound) {
         [void]$out.Append('<p class="not-configured">Not configured.</p>')
     }
     else {
-        $enabled = XHas $unbound 'enable'
-        $ai = XText $unbound 'active_interface'; if (-not $ai) { $ai = 'All' }
+        $ai = XText $unbound 'active_interface';   if (-not $ai) { $ai = 'All' }
         $oi = XText $unbound 'outgoing_interface'; if (-not $oi) { $oi = 'All' }
-        $fwd = XHas $unbound 'forwarding'
-        $kv = New-Object System.Text.StringBuilder
-        [void]$kv.Append('<table class="kv">')
-        [void]$kv.Append('<tr><th>Enabled</th><td>' + (YesNo $enabled) + '</td></tr>')
-        [void]$kv.Append('<tr><th>Listening interfaces</th><td>' + (DashMono $ai) + '</td></tr>')
-        [void]$kv.Append('<tr><th>Outgoing interfaces</th><td>' + (DashMono $oi) + '</td></tr>')
-        [void]$kv.Append('<tr><th>DNSSEC</th><td>' + (YesNo (XHas $unbound 'dnssec')) + '</td></tr>')
-        [void]$kv.Append('<tr><th>Forwarding mode</th><td>' + (YesNo $fwd) + '</td></tr>')
-        [void]$kv.Append('<tr><th>Register DHCP leases / static</th><td>' + (YesNo (XHas $unbound 'regdhcp')) + ' / ' + (YesNo (XHas $unbound 'regdhcpstatic')) + '</td></tr>')
-        [void]$kv.Append('</table>')
-        [void]$out.Append('<div class="table-wrap">' + $kv.ToString() + '</div>')
-
-        $hosts = XNodes $unbound 'hosts'
-        if ($hosts.Count -gt 0) {
-            $sb = New-Object System.Text.StringBuilder
-            foreach ($h in $hosts) {
-                $alItems = New-Object 'System.Collections.Generic.List[string]'
-                foreach ($al in (XNodes $h 'aliases/item')) {
-                    $ah = XText $al 'host'; $ad = XText $al 'domain'
-                    if ($ah -and $ad) { [void]$alItems.Add("$ah.$ad") } elseif ($ah) { [void]$alItems.Add($ah) }
-                }
-                [void]$sb.Append('<tr><td>' + (E-Host (XText $h 'host')) + '</td><td>' + (Dash (XText $h 'domain')) + '</td><td>' + (DashMono (XText $h 'ip')) + '</td><td>' + $(if ($alItems.Count) { ($alItems | ForEach-Object { E-Host $_ }) -join '<br>' } else { '<span class="muted">&mdash;</span>' }) + '</td><td>' + (Dash (XText $h 'descr')) + '</td></tr>')
-            }
-            [void]$out.Append('<p class="subtitle">Host overrides (' + $hosts.Count + ')</p>' + (Tbl @('Host','Domain','IP','Aliases','Description') $sb.ToString() 'filterable-table'))
-        }
-        $doms = XNodes $unbound 'domainoverrides'
-        if ($doms.Count -gt 0) {
-            $sb = New-Object System.Text.StringBuilder
-            foreach ($d in $doms) {
-                [void]$sb.Append('<tr><td>' + (Dash (XText $d 'domain')) + '</td><td>' + (DashMono (XText $d 'ip')) + '</td><td>' + (Dash (XText $d 'descr')) + '</td></tr>')
-            }
-            [void]$out.Append('<p class="subtitle">Domain overrides (' + $doms.Count + ')</p>' + (Tbl @('Domain','Forward-to IP','Description') $sb.ToString() 'filterable-table'))
-        }
+        [void]$out.Append((Format-KvTable @(
+            @('Enabled',                       (YesNo (XHas $unbound 'enable'))),
+            @('Listening interfaces',          (DashMono $ai)),
+            @('Outgoing interfaces',           (DashMono $oi)),
+            @('DNSSEC',                        (YesNo (XHas $unbound 'dnssec'))),
+            @('Forwarding mode',               (YesNo (XHas $unbound 'forwarding'))),
+            @('Register DHCP leases / static', ((YesNo (XHas $unbound 'regdhcp')) + ' / ' + (YesNo (XHas $unbound 'regdhcpstatic'))))
+        )))
+        [void]$out.Append((Build-DnsOverrides $unbound $true))
     }
 
-    # Forwarder (dnsmasq)
     $dnsmasq = $root.SelectSingleNode('dnsmasq')
     [void]$out.Append('<h3>DNS Forwarder (dnsmasq)</h3>')
     if ($null -eq $dnsmasq -or -not (XHas $dnsmasq 'enable')) {
@@ -2294,118 +1731,56 @@ function Build-Dns {
     }
     else {
         $dmIf = XText $dnsmasq 'interface'; if (-not $dmIf) { $dmIf = 'All' }
-        $kv = '<table class="kv"><tr><th>Enabled</th><td>' + (YesNo $true) + '</td></tr><tr><th>Interfaces</th><td>' + (DashMono $dmIf) + '</td></tr></table>'
-        [void]$out.Append('<div class="table-wrap">' + $kv + '</div>')
-        $hosts = XNodes $dnsmasq 'hosts'
-        if ($hosts.Count -gt 0) {
-            $sb = New-Object System.Text.StringBuilder
-            foreach ($h in $hosts) {
-                [void]$sb.Append('<tr><td>' + (E-Host (XText $h 'host')) + '</td><td>' + (Dash (XText $h 'domain')) + '</td><td>' + (DashMono (XText $h 'ip')) + '</td><td>' + (Dash (XText $h 'descr')) + '</td></tr>')
-            }
-            [void]$out.Append('<p class="subtitle">Host overrides (' + $hosts.Count + ')</p>' + (Tbl @('Host','Domain','IP','Description') $sb.ToString() 'filterable-table'))
-        }
-        $doms = XNodes $dnsmasq 'domainoverrides'
-        if ($doms.Count -gt 0) {
-            $sb = New-Object System.Text.StringBuilder
-            foreach ($d in $doms) {
-                [void]$sb.Append('<tr><td>' + (Dash (XText $d 'domain')) + '</td><td>' + (DashMono (XText $d 'ip')) + '</td><td>' + (Dash (XText $d 'descr')) + '</td></tr>')
-            }
-            [void]$out.Append('<p class="subtitle">Domain overrides (' + $doms.Count + ')</p>' + (Tbl @('Domain','Forward-to IP','Description') $sb.ToString() 'filterable-table'))
-        }
+        [void]$out.Append((Format-KvTable @(@('Enabled', (YesNo $true)), @('Interfaces', (DashMono $dmIf)))))
+        [void]$out.Append((Build-DnsOverrides $dnsmasq $false))
     }
     return $out.ToString()
 }
 
+function Build-CertRows {
+    param($nodes, [bool]$IsCa)
+    $sb = New-Object System.Text.StringBuilder
+    $prefix = if ($IsCa) { 'ca-' } else { 'cert-' }
+    $kindLabel = if ($IsCa) { 'CA' } else { 'Certificate' }
+    foreach ($c in $nodes) {
+        $rid = XText $c 'refid'; $rowId = $prefix + (Format-Slug $rid); $descr = XText $c 'descr'
+        $info = Get-CertInfo (XText $c 'crt')
+        $status = Format-CertStatus $info ("$kindLabel '" + $(if ($descr) { $descr } else { $rid }) + "'") $rowId
+        $nb = if ($info.NotBefore) { $info.NotBefore.ToString('yyyy-MM-dd') } else { '' }
+        $na = if ($info.NotAfter)  { $info.NotAfter.ToString('yyyy-MM-dd') }  else { '' }
+        $keyInfo = if ($info.KeyAlg -and $info.KeySize) { "$($info.KeyAlg) $($info.KeySize)b" } else { '' }
+        $algDisp = if ($info.SigAlg -and $keyInfo) { "$($info.SigAlg) / $keyInfo" } elseif ($info.SigAlg) { $info.SigAlg } else { $keyInfo }
+        $valCell = if ($nb -or $na) { '<code class="mono">' + (E $nb) + '</code> &rarr; <code class="mono">' + (E $na) + '</code>' } else { '<span class="muted">&mdash;</span>' }
+        $typeDisp = if ($IsCa) { 'Certificate Authority' } else {
+            $t = XText $c 'type'
+            $td = switch ($t) { 'server' { 'Server' } 'user' { 'User' } default { if ($t) { $t } else { 'Unknown' } } }
+            if ($info.SelfSigned) { "$td (Self-signed)" } else { $td }
+        }
+        $uses = @()
+        if ($rid -and $script:RefUsageMap.ContainsKey($rid)) { $uses = @($script:RefUsageMap[$rid]) }
+        $usedBy = if ($uses.Count -gt 0) { ($uses | ForEach-Object { E $_ }) -join '<br>' } else { '<span class="muted">Not referenced</span>' }
+        Add-Row $sb -Id $rowId -Cells @(
+            (Dash $descr), (E $typeDisp), ('<td class="wrapcell">' + (E-CertDn $info.Subject) + '</td>'),
+            (DashMono $algDisp), $valCell, $status, $usedBy
+        )
+    }
+    return (Tbl @('Name','Type','Subject','Sig / Key','Validity','Status','Used by') $sb.ToString())
+}
+
 function Build-Certs {
     param($root)
-    $cas   = XNodes $root 'ca'
-    $certs = XNodes $root 'cert'
-    $crls  = XNodes $root 'crl'
+    $cas = XNodes $root 'ca'; $certs = XNodes $root 'cert'; $crls = XNodes $root 'crl'
     if ($cas.Count -eq 0 -and $certs.Count -eq 0 -and $crls.Count -eq 0) { return '' }
     $out = New-Object System.Text.StringBuilder
-
-    if ($cas.Count -gt 0) {
-        [void]$out.Append('<h3>Certificate Authorities</h3>')
-        $sb = New-Object System.Text.StringBuilder
-        foreach ($c in $cas) {
-            $rid   = XText $c 'refid'
-            $rowId = 'ca-' + (Format-Slug $rid)
-            $descr = XText $c 'descr'
-            $info  = Get-CertInfo (XText $c 'crt')
-            $status = Format-CertStatus $info ("CA '" + $(if ($descr) { $descr } else { $rid }) + "'") $rowId
-            $nb    = if ($info.NotBefore) { $info.NotBefore.ToString('yyyy-MM-dd') } else { '' }
-            $na    = if ($info.NotAfter)  { $info.NotAfter.ToString('yyyy-MM-dd') }  else { '' }
-            $keyInfo = if ($info.KeyAlg -and $info.KeySize) { "$($info.KeyAlg) $($info.KeySize)b" } else { '' }
-            $algDisp = if ($info.SigAlg -and $keyInfo) { "$($info.SigAlg) / $keyInfo" } elseif ($info.SigAlg) { $info.SigAlg } else { $keyInfo }
-            $uses  = @()
-            if ($rid -and $script:RefUsageMap.ContainsKey($rid)) { $uses = @($script:RefUsageMap[$rid]) }
-            $usedBy = if ($uses.Count -gt 0) { ($uses | ForEach-Object { E $_ }) -join '<br>' } else { '<span class="muted">Not referenced</span>' }
-            [void]$sb.Append('<tr id="' + $rowId + '">')
-            [void]$sb.Append('<td>' + (Dash $descr) + '</td>')
-            [void]$sb.Append('<td>Certificate Authority</td>')
-            [void]$sb.Append('<td class="wrapcell">' + (E-CertDn $info.Subject) + '</td>')
-            [void]$sb.Append('<td>' + (DashMono $algDisp) + '</td>')
-            $valCell = if ($nb -or $na) { '<code class="mono">' + (E $nb) + '</code> &rarr; <code class="mono">' + (E $na) + '</code>' } else { '<span class="muted">&mdash;</span>' }
-            [void]$sb.Append('<td>' + $valCell + '</td>')
-            [void]$sb.Append('<td>' + $status + '</td>')
-            [void]$sb.Append('<td>' + $usedBy + '</td>')
-            [void]$sb.Append('</tr>')
-        }
-        [void]$out.Append((Tbl @('Name','Type','Subject','Sig / Key','Validity','Status','Used by') $sb.ToString()))
-    }
-
-    if ($certs.Count -gt 0) {
-        [void]$out.Append('<h3>Certificates</h3>')
-        $sb = New-Object System.Text.StringBuilder
-        foreach ($c in $certs) {
-            $rid   = XText $c 'refid'
-            $rowId = 'cert-' + (Format-Slug $rid)
-            $descr = XText $c 'descr'
-            $type  = XText $c 'type'
-            $info  = Get-CertInfo (XText $c 'crt')
-            $status = Format-CertStatus $info ("Certificate '" + $(if ($descr) { $descr } else { $rid }) + "'") $rowId
-            $nb    = if ($info.NotBefore) { $info.NotBefore.ToString('yyyy-MM-dd') } else { '' }
-            $na    = if ($info.NotAfter)  { $info.NotAfter.ToString('yyyy-MM-dd') }  else { '' }
-            $keyInfo = if ($info.KeyAlg -and $info.KeySize) { "$($info.KeyAlg) $($info.KeySize)b" } else { '' }
-            $algDisp = if ($info.SigAlg -and $keyInfo) { "$($info.SigAlg) / $keyInfo" } elseif ($info.SigAlg) { $info.SigAlg } else { $keyInfo }
-            $typeDisp = switch ($type) {
-                'server' { 'Server' }
-                'user'   { 'User' }
-                default  { if ($type) { $type } else { 'Unknown' } }
-            }
-            if ($info.SelfSigned) { $typeDisp += ' (Self-signed)' }
-            $uses  = @()
-            if ($rid -and $script:RefUsageMap.ContainsKey($rid)) { $uses = @($script:RefUsageMap[$rid]) }
-            $usedBy = if ($uses.Count -gt 0) { ($uses | ForEach-Object { E $_ }) -join '<br>' } else { '<span class="muted">Not referenced</span>' }
-            [void]$sb.Append('<tr id="' + $rowId + '">')
-            [void]$sb.Append('<td>' + (Dash $descr) + '</td>')
-            [void]$sb.Append('<td>' + (E $typeDisp) + '</td>')
-            [void]$sb.Append('<td class="wrapcell">' + (E-CertDn $info.Subject) + '</td>')
-            [void]$sb.Append('<td>' + (DashMono $algDisp) + '</td>')
-            $valCell = if ($nb -or $na) { '<code class="mono">' + (E $nb) + '</code> &rarr; <code class="mono">' + (E $na) + '</code>' } else { '<span class="muted">&mdash;</span>' }
-            [void]$sb.Append('<td>' + $valCell + '</td>')
-            [void]$sb.Append('<td>' + $status + '</td>')
-            [void]$sb.Append('<td>' + $usedBy + '</td>')
-            [void]$sb.Append('</tr>')
-        }
-        [void]$out.Append((Tbl @('Name','Type','Subject','Sig / Key','Validity','Status','Used by') $sb.ToString()))
-    }
-
+    if ($cas.Count -gt 0)   { [void]$out.Append('<h3>Certificate Authorities</h3>').Append((Build-CertRows $cas $true)) }
+    if ($certs.Count -gt 0) { [void]$out.Append('<h3>Certificates</h3>').Append((Build-CertRows $certs $false)) }
     if ($crls.Count -gt 0) {
-        [void]$out.Append('<h3>Certificate Revocation Lists (CRLs)</h3>')
         $sb = New-Object System.Text.StringBuilder
         foreach ($crl in $crls) {
-            $revCount = (XNodes $crl 'cert').Count
-            [void]$sb.Append('<tr>')
-            [void]$sb.Append('<td>' + (Dash (XText $crl 'descr')) + '</td>')
-            [void]$sb.Append('<td>' + (Format-CertRef (XText $crl 'caref')) + '</td>')
-            [void]$sb.Append('<td>' + (Dash (XText $crl 'method')) + '</td>')
-            [void]$sb.Append('<td>' + $revCount + '</td>')
-            [void]$sb.Append('</tr>')
+            Add-Row $sb @((Dash (XText $crl 'descr')), (Format-CertRef (XText $crl 'caref')), (Dash (XText $crl 'method')), [string](XNodes $crl 'cert').Count)
         }
-        [void]$out.Append((Tbl @('Name','CA','Method','Revoked Certs') $sb.ToString()))
+        [void]$out.Append('<h3>Certificate Revocation Lists (CRLs)</h3>').Append((Tbl @('Name','CA','Method','Revoked Certs') $sb.ToString()))
     }
-
     [void]$out.Append('<p class="note">Private key material is never exported by this report, regardless of options.</p>')
     return $out.ToString()
 }
@@ -2414,18 +1789,11 @@ function Build-Users {
     param($root)
     $sys = $root.SelectSingleNode('system')
     if ($null -eq $sys) { return '' }
-    $users  = XNodes $sys 'user'
-    $groups = XNodes $sys 'group'
-    $auths  = XNodes $sys 'authserver'
+    $users = XNodes $sys 'user'; $groups = XNodes $sys 'group'; $auths = XNodes $sys 'authserver'
     if ($users.Count -eq 0 -and $groups.Count -eq 0 -and $auths.Count -eq 0) { return '' }
 
-    # uid -> name map & uid -> groups reverse map
-    $uidMap = @{}
-    foreach ($u in $users) {
-        $uid = XText $u 'uid'
-        if ($uid -ne '') { $uidMap[$uid] = (XText $u 'name') }
-    }
-    $uidGroups = @{}
+    $uidMap = @{}; $uidGroups = @{}
+    foreach ($u in $users) { $uid = XText $u 'uid'; if ($uid -ne '') { $uidMap[$uid] = XText $u 'name' } }
     foreach ($g in $groups) {
         $gn = XText $g 'name'
         foreach ($m in (XNodes $g 'member')) {
@@ -2439,161 +1807,100 @@ function Build-Users {
 
     $out = New-Object System.Text.StringBuilder
     if ($users.Count -gt 0) {
-        [void]$out.Append('<h3>Users</h3>')
         $sb = New-Object System.Text.StringBuilder
         foreach ($u in $users) {
-            $uname    = XText $u 'name'
-            $uid      = XText $u 'uid'
-            $rowId    = 'row-user-' + (Format-Slug $(if ($uname) { $uname } else { $uid }))
-            $disabled = XHas $u 'disabled'
-            $expires  = XText $u 'expires'
-            $authKeys = XText $u 'authorizedkeys'
-            $keyCount = 0
+            $uname = XText $u 'name'; $uid = XText $u 'uid'
+            $rowId = 'row-user-' + (Format-Slug $(if ($uname) { $uname } else { $uid }))
+            $disabled = XHas $u 'disabled'; $authKeys = XText $u 'authorizedkeys'; $keyCount = 0
             if ($authKeys) {
                 try {
                     $decoded = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(($authKeys -replace '\s', '')))
                     $keyCount = @($decoded -split "`r?`n" | Where-Object { $_.Trim() -and -not $_.Trim().StartsWith('#') }).Count
                 }
-                catch {
-                    Write-Verbose ("Could not decode authorizedkeys for user '{0}': {1}" -f $uname, $_.Exception.Message)
-                    $keyCount = 1
-                }
+                catch { Write-Verbose ("Could not decode authorizedkeys for '{0}': {1}" -f $uname, $_.Exception.Message); $keyCount = 1 }
             }
-            $privs = New-Object 'System.Collections.Generic.List[string]'
-            foreach ($p in (XNodes $u 'priv')) { if ($p.InnerText.Trim()) { [void]$privs.Add($p.InnerText.Trim()) } }
-
+            $privs = @(foreach ($p in (XNodes $u 'priv')) { $p.InnerText.Trim() })
             $gList = New-Object 'System.Collections.Generic.List[string]'
-            $gProp = XText $u 'groupname'
-            if ($gProp) { [void]$gList.Add($gProp) }
+            $gProp = XText $u 'groupname'; if ($gProp) { [void]$gList.Add($gProp) }
             if ($uid -ne '' -and $uidGroups.ContainsKey($uid)) {
                 foreach ($gn in $uidGroups[$uid]) { if (-not $gList.Contains($gn)) { [void]$gList.Add($gn) } }
             }
-
-            $hashType = ''
-            if (XHas $u 'bcrypt-hash')      { $hashType = 'bcrypt' }
-            elseif (XHas $u 'sha512-hash')  { $hashType = 'sha512' }
-            elseif (XHas $u 'md5-hash')     { $hashType = 'md5' }
-
+            $hashType = if (XHas $u 'bcrypt-hash') { 'bcrypt' } elseif (XHas $u 'sha512-hash') { 'sha512' } elseif (XHas $u 'md5-hash') { 'md5' } else { '' }
             $hashBadge = ''
             if ($hashType -eq 'md5' -and -not $disabled) {
-                $hashBadge = ' <span class="badge badge-high">WEAK HASH</span>'
+                $hashBadge = ' ' + (Badge 'WEAK HASH' 'high' $true)
                 Add-Finding 'high' 'WEAK PASSWORD HASH' ("User '$uname'") 'Account uses legacy MD5 password hash instead of bcrypt.' $rowId
             }
-
-            $cls = if ($disabled) { ' class="row-disabled"' } else { '' }
-            [void]$sb.Append('<tr id="' + $rowId + '"' + $cls + '>')
-            [void]$sb.Append('<td>' + (E-User $uname) + '</td>')
-            [void]$sb.Append('<td>' + (YesNo (-not $disabled)) + '</td>')
-            [void]$sb.Append('<td>' + (Dash (XText $u 'descr')) + '</td>')
-            [void]$sb.Append('<td>' + (Dash (XText $u 'scope')) + '</td>')
-            [void]$sb.Append('<td>' + $(if ($gList.Count) { ($gList | ForEach-Object { E $_ }) -join ', ' } else { '<span class="muted">&mdash;</span>' }) + '</td>')
-            [void]$sb.Append('<td>' + $(if ($privs.Count) { ($privs | ForEach-Object { E $_ }) -join '<br>' } else { '<span class="muted">&mdash;</span>' }) + '</td>')
-            [void]$sb.Append('<td>' + $(if ($keyCount -gt 0) { '<span class="badge badge-info">' + $keyCount + ' key(s)</span>' } else { '<span class="muted">&mdash;</span>' }) + '</td>')
-            [void]$sb.Append('<td>' + (Dash $expires) + '</td>')
-            [void]$sb.Append('<td><span class="muted">' + $(if ($hashType) { '[' + $hashType + ' hash not shown]' } else { '[none]' }) + '</span>' + $hashBadge + '</td>')
-            [void]$sb.Append('</tr>')
+            Add-Row $sb -Id $rowId -Disabled $disabled -Cells @(
+                (E-User $uname), (YesNo (-not $disabled)), (Dash (XText $u 'descr')), (Dash (XText $u 'scope')),
+                (Format-ListCell $gList.ToArray() -Separator ', '), (Format-ListCell $privs),
+                $(if ($keyCount -gt 0) { Badge "$keyCount key(s)" 'info' $true } else { '<span class="muted">&mdash;</span>' }),
+                (Dash (XText $u 'expires')),
+                ('<span class="muted">' + $(if ($hashType) { "[$hashType hash not shown]" } else { '[none]' }) + '</span>' + $hashBadge)
+            )
         }
-        [void]$out.Append((Tbl @('Username','Enabled','Full name','Scope','Groups','Privileges','SSH Keys','Expires','Password') $sb.ToString()))
+        [void]$out.Append('<h3>Users</h3>').Append((Tbl @('Username','Enabled','Full name','Scope','Groups','Privileges','SSH Keys','Expires','Password') $sb.ToString()))
         [void]$out.Append('<p class="note">Password hashes and SSH key bodies are never exported by this report, regardless of options.</p>')
     }
 
     if ($groups.Count -gt 0) {
-        [void]$out.Append('<h3>Groups</h3>')
         $sb = New-Object System.Text.StringBuilder
         foreach ($g in $groups) {
-            $privs = New-Object 'System.Collections.Generic.List[string]'
-            foreach ($p in (XNodes $g 'priv')) { if ($p.InnerText.Trim()) { [void]$privs.Add($p.InnerText.Trim()) } }
-            $members = New-Object 'System.Collections.Generic.List[string]'
-            foreach ($m in (XNodes $g 'member')) {
+            $privs = @(foreach ($p in (XNodes $g 'priv')) { $p.InnerText.Trim() })
+            $members = @(foreach ($m in (XNodes $g 'member')) {
                 $mv = $m.InnerText.Trim()
-                if ($uidMap.ContainsKey($mv)) { [void]$members.Add($uidMap[$mv]) } elseif ($mv) { [void]$members.Add("uid:$mv") }
-            }
-            [void]$sb.Append('<tr>')
-            [void]$sb.Append('<td>' + (Dash (XText $g 'name')) + '</td>')
-            [void]$sb.Append('<td>' + (Dash (XText $g 'description')) + '</td>')
-            [void]$sb.Append('<td>' + (Dash (XText $g 'scope')) + '</td>')
-            [void]$sb.Append('<td>' + $(if ($members.Count) { ($members | ForEach-Object { E-User $_ }) -join '<br>' } else { '<span class="muted">&mdash;</span>' }) + '</td>')
-            [void]$sb.Append('<td>' + $(if ($privs.Count) { ($privs | ForEach-Object { E $_ }) -join '<br>' } else { '<span class="muted">&mdash;</span>' }) + '</td>')
-            [void]$sb.Append('</tr>')
+                if ($uidMap.ContainsKey($mv)) { $uidMap[$mv] } elseif ($mv) { "uid:$mv" }
+            })
+            Add-Row $sb @((Dash (XText $g 'name')), (Dash (XText $g 'description')), (Dash (XText $g 'scope')), (Format-ListCell $members -Mode 'user'), (Format-ListCell $privs))
         }
-        [void]$out.Append((Tbl @('Group','Description','Scope','Members','Privileges') $sb.ToString()))
+        [void]$out.Append('<h3>Groups</h3>').Append((Tbl @('Group','Description','Scope','Members','Privileges') $sb.ToString()))
     }
 
     if ($auths.Count -gt 0) {
-        [void]$out.Append('<h3>Authentication Servers (LDAP / RADIUS)</h3>')
-        $sb = New-Object System.Text.StringBuilder
-        $aSeq = 0
+        $sb = New-Object System.Text.StringBuilder; $aSeq = 0
         foreach ($a in $auths) {
-            $aSeq++
-            $rowId = 'row-auth-' + $aSeq
-            $aname = XText $a 'name'
-            $atype = XText $a 'type'
-            $ahost = XText $a 'host'
+            $aSeq++; $rowId = "row-auth-$aSeq"
+            $aname = XText $a 'name'; $atype = XText $a 'type'
             $port  = if ($atype -ieq 'ldap') { XText $a 'ldap_port' } else { XText $a 'radius_auth_port' }
             $trans = if ($atype -ieq 'ldap') { XText $a 'ldap_urltype' } else { 'RADIUS' }
-            $badge = ''
-            $cls   = ''
+            $badge = ''; $rowCls = ''
             if ($atype -ieq 'ldap' -and $trans -match '(?i)standard\s*tcp') {
-                $badge = ' <span class="badge badge-high">PLAINTEXT LDAP</span>'
-                $cls = ' class="row-high"'
+                $badge = ' ' + (Badge 'PLAINTEXT LDAP' 'high' $true); $rowCls = 'row-high'
                 Add-Finding 'high' 'PLAINTEXT LDAP' ("Auth server '$aname'") 'LDAP server uses unencrypted Standard TCP instead of SSL/TLS or STARTTLS.' $rowId
             }
-            [void]$sb.Append('<tr id="' + $rowId + '"' + $cls + '>')
-            [void]$sb.Append('<td>' + (Dash $aname) + $badge + '</td>')
-            [void]$sb.Append('<td>' + (Dash $atype.ToUpperInvariant()) + '</td>')
-            [void]$sb.Append('<td>' + (DashMono $ahost) + '</td>')
-            [void]$sb.Append('<td>' + (DashMono $port) + '</td>')
-            [void]$sb.Append('<td>' + (Dash $trans) + '</td>')
-            [void]$sb.Append('<td><span class="muted">[credentials not shown]</span></td>')
-            [void]$sb.Append('</tr>')
+            Add-Row $sb -Id $rowId -Class $rowCls -Cells @(
+                ((Dash $aname) + $badge), (Dash $atype.ToUpperInvariant()), (DashMono (XText $a 'host')),
+                (DashMono $port), (Dash $trans), '<span class="muted">[credentials not shown]</span>'
+            )
         }
-        [void]$out.Append((Tbl @('Name','Type','Host','Port','Transport','Secrets') $sb.ToString()))
+        [void]$out.Append('<h3>Authentication Servers (LDAP / RADIUS)</h3>').Append((Tbl @('Name','Type','Host','Port','Transport','Secrets') $sb.ToString()))
     }
     return $out.ToString()
 }
 
 function Build-Aliases {
     param($root)
-    $al = $root.SelectSingleNode('aliases')
-    if ($null -eq $al) { return '' }
-    $aliases = XNodes $al 'alias'
+    $aliases = XNodes $root 'aliases/alias'
     if ($aliases.Count -eq 0) { return '' }
     $sb = New-Object System.Text.StringBuilder
     foreach ($a in $aliases) {
-        $name   = XText $a 'name'
-        $rowId  = if ($name) { ' id="alias-' + (Format-Slug $name) + '"' } else { '' }
-        $type   = XText $a 'type'
-        $addr   = XText $a 'address'
-        $url    = XText $a 'url'
-        $freq   = XText $a 'updatefreq'
+        $name = XText $a 'name'; $addr = XText $a 'address'; $url = XText $a 'url'; $freq = XText $a 'updatefreq'
         $detail = XText $a 'detail'
-        $detArr = @()
-        if ($detail) { $detArr = @($detail -split '\|\|') }
-
+        $detArr = @(); if ($detail) { $detArr = @($detail -split '\|\|') }
         $addrDisp = '<span class="muted">&mdash;</span>'
         if ($addr) {
             $entries = @($addr -split '\s+' | Where-Object { $_ })
-            $lines = New-Object 'System.Collections.Generic.List[string]'
-            for ($i = 0; $i -lt $entries.Count; $i++) {
-                $line = '<code class="mono">' + (E $entries[$i]) + '</code>'
-                if ($i -lt $detArr.Count -and -not [string]::IsNullOrWhiteSpace($detArr[$i])) {
-                    $line += ' <span class="muted">&mdash; ' + (E $detArr[$i].Trim()) + '</span>'
-                }
-                [void]$lines.Add($line)
-            }
+            $lines = @(for ($i = 0; $i -lt $entries.Count; $i++) {
+                (DashMono $entries[$i]) + $(if ($i -lt $detArr.Count -and -not [string]::IsNullOrWhiteSpace($detArr[$i])) { ' <span class="muted">&mdash; ' + (E $detArr[$i].Trim()) + '</span>' } else { '' })
+            })
             $addrDisp = $lines -join '<br>'
         }
         elseif ($url) {
-            $addrDisp = '<code class="mono">' + (E $url) + '</code>'
-            if ($freq) { $addrDisp += ' <span class="muted">(every ' + (E $freq) + 'd)</span>' }
+            $addrDisp = (DashMono $url) + $(if ($freq) { ' <span class="muted">(every ' + (E $freq) + 'd)</span>' } else { '' })
         }
-
-        [void]$sb.Append('<tr' + $rowId + '>')
-        [void]$sb.Append('<td><code class="mono">' + (E $name) + '</code></td>')
-        [void]$sb.Append('<td>' + (Dash $type) + '</td>')
-        [void]$sb.Append('<td class="wrapcell">' + $addrDisp + '</td>')
-        [void]$sb.Append('<td>' + (Dash (XText $a 'descr')) + '</td>')
-        [void]$sb.Append('</tr>')
+        Add-Row $sb -Id $(if ($name) { 'alias-' + (Format-Slug $name) } else { '' }) -Cells @(
+            (DashMono $name), (Dash (XText $a 'type')), ('<td class="wrapcell">' + $addrDisp + '</td>'), (Dash (XText $a 'descr'))
+        )
     }
     return (Tbl @('Name','Type','Contents','Description') $sb.ToString() 'filterable-table')
 }
@@ -2602,149 +1909,104 @@ function Build-Services {
     param($root)
     $out = New-Object System.Text.StringBuilder
 
-    # SNMP
     $snmp = $root.SelectSingleNode('snmpd')
     if ($null -ne $snmp -and ((XHas $snmp 'enable') -or (XText $snmp 'rocommunity'))) {
-        $en   = XHas $snmp 'enable'
-        $comm = XText $snmp 'rocommunity'
-        $bind = XText $snmp 'bindip'; if (-not $bind) { $bind = 'All' }
+        $en = XHas $snmp 'enable'; $comm = XText $snmp 'rocommunity'
+        $bind = XText $snmp 'bindip';   if (-not $bind) { $bind = 'All' }
         $port = XText $snmp 'pollport'; if (-not $port) { $port = '161 (default)' }
-        $trap = XText $snmp 'trapserver'
         $commBadge = ''
         if ($en -and $comm -match '(?i)^(public|private)$') {
-            $commBadge = ' <span class="badge badge-high">DEFAULT COMMUNITY</span>'
+            $commBadge = ' ' + (Badge 'DEFAULT COMMUNITY' 'high' $true)
             Add-Finding 'high' 'DEFAULT SNMP COMMUNITY' 'Services / SNMP' 'SNMP is enabled with a default community string (public/private).' 'row-svc-snmp'
         }
-        $kv = New-Object System.Text.StringBuilder
-        [void]$kv.Append('<table class="kv">')
-        [void]$kv.Append('<tr id="row-svc-snmp"><th>Enabled</th><td>' + (YesNo $en) + '</td></tr>')
-        [void]$kv.Append('<tr><th>Bind interface / IP</th><td>' + (DashMono $bind) + '</td></tr>')
-        [void]$kv.Append('<tr><th>Polling port</th><td>' + (DashMono $port) + '</td></tr>')
-        [void]$kv.Append('<tr><th>Read-only community</th><td>' + (Secret $comm) + $commBadge + '</td></tr>')
-        if ($trap) { [void]$kv.Append('<tr><th>Trap server</th><td>' + (DashMono $trap) + '</td></tr>') }
-        [void]$kv.Append('</table>')
-        [void]$out.Append('<h3>SNMP</h3><div class="table-wrap">' + $kv.ToString() + '</div>')
+        $rows = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($r in @(
+            @('Enabled',             (YesNo $en), 'row-svc-snmp'),
+            @('Bind interface / IP', (DashMono $bind)),
+            @('Polling port',        (DashMono $port)),
+            @('Read-only community', ((Secret $comm) + $commBadge))
+        )) { [void]$rows.Add($r) }
+        $trap = XText $snmp 'trapserver'; if ($trap) { [void]$rows.Add(@('Trap server', (DashMono $trap))) }
+        [void]$out.Append('<h3>SNMP</h3>').Append((Format-KvTable $rows.ToArray()))
     }
 
-    # Syslog
     $syslog = $root.SelectSingleNode('syslog')
     if ($null -ne $syslog -and ((XHas $syslog 'enable') -or (XText $syslog 'remoteserver'))) {
-        $remEn = XHas $syslog 'enable'
-        $svrs  = @((XText $syslog 'remoteserver'), (XText $syslog 'remoteserver2'), (XText $syslog 'remoteserver3') | Where-Object { $_ })
-        $kv = '<table class="kv">' +
-              '<tr><th>Remote logging enabled</th><td>' + (YesNo $remEn) + '</td></tr>' +
-              '<tr><th>Remote server(s)</th><td>' + $(if ($svrs.Count) { ($svrs | ForEach-Object { DashMono $_ }) -join '<br>' } else { '<span class="muted">&mdash;</span>' }) + '</td></tr>' +
-              '<tr><th>Source interface</th><td>' + (DashMono (XText $syslog 'sourceip')) + '</td></tr>' +
-              '<tr><th>Log default blocks</th><td>' + (YesNo (-not (XHas $syslog 'nologdefaultblock'))) + '</td></tr>' +
-              '</table>'
-        [void]$out.Append('<h3>Syslog</h3><div class="table-wrap">' + $kv + '</div>')
+        $svrs = @((XText $syslog 'remoteserver'), (XText $syslog 'remoteserver2'), (XText $syslog 'remoteserver3'))
+        [void]$out.Append('<h3>Syslog</h3>').Append((Format-KvTable @(
+            @('Remote logging enabled', (YesNo (XHas $syslog 'enable'))),
+            @('Remote server(s)',       (Format-ListCell $svrs -Mode 'mono')),
+            @('Source interface',       (DashMono (XText $syslog 'sourceip'))),
+            @('Log default blocks',     (YesNo (-not (XHas $syslog 'nologdefaultblock'))))
+        )))
     }
 
-    # Dynamic DNS
     $ddns = XNodes $root 'dyndnses/dyndns'
     if ($ddns.Count -gt 0) {
         $sb = New-Object System.Text.StringBuilder
         foreach ($d in $ddns) {
             $en = XHas $d 'enable'
-            $cls = if (-not $en) { ' class="row-disabled"' } else { '' }
-            [void]$sb.Append('<tr' + $cls + '>')
-            [void]$sb.Append('<td>' + (Dash (XText $d 'type')) + '</td>')
-            [void]$sb.Append('<td>' + (DashMono (XText $d 'interface')) + '</td>')
-            [void]$sb.Append('<td>' + (DashMono (XText $d 'host')) + '</td>')
-            [void]$sb.Append('<td>' + (YesNo $en) + '</td>')
-            [void]$sb.Append('<td>' + (Dash (XText $d 'descr')) + '</td>')
-            [void]$sb.Append('</tr>')
+            Add-Row $sb -Disabled (-not $en) -Cells @((Dash (XText $d 'type')), (DashMono (XText $d 'interface')), (DashMono (XText $d 'host')), (YesNo $en), (Dash (XText $d 'descr')))
         }
-        [void]$out.Append('<h3>Dynamic DNS</h3>' + (Tbl @('Service','Interface','Hostname','Enabled','Description') $sb.ToString()))
+        [void]$out.Append('<h3>Dynamic DNS</h3>').Append((Tbl @('Service','Interface','Hostname','Enabled','Description') $sb.ToString()))
         [void]$out.Append('<p class="note">Dynamic DNS passwords and API tokens are never exported.</p>')
     }
 
-    # Schedules
     $scheds = XNodes $root 'schedules/schedule'
     if ($scheds.Count -gt 0) {
         $sb = New-Object System.Text.StringBuilder
-        foreach ($s in $scheds) {
-            [void]$sb.Append('<tr>')
-            [void]$sb.Append('<td>' + (DashMono (XText $s 'name')) + '</td>')
-            [void]$sb.Append('<td>' + (Dash (XText $s 'descr')) + '</td>')
-            [void]$sb.Append('</tr>')
-        }
-        [void]$out.Append('<h3>Schedules</h3>' + (Tbl @('Name','Description') $sb.ToString()))
+        foreach ($s in $scheds) { Add-Row $sb @((DashMono (XText $s 'name')), (Dash (XText $s 'descr'))) }
+        [void]$out.Append('<h3>Schedules</h3>').Append((Tbl @('Name','Description') $sb.ToString()))
     }
-
     return $out.ToString()
 }
 
 function Build-Packages {
     param($root)
-    $ip = $root.SelectSingleNode('installedpackages')
-    if ($null -eq $ip) { return '' }
-    $pkgs = XNodes $ip 'package'
+    $pkgs = XNodes $root 'installedpackages/package'
     if ($pkgs.Count -eq 0) { return '' }
     $sb = New-Object System.Text.StringBuilder
-    foreach ($p in $pkgs) {
-        [void]$sb.Append('<tr>')
-        [void]$sb.Append('<td>' + (Dash (XText $p 'name')) + '</td>')
-        [void]$sb.Append('<td>' + (DashMono (XText $p 'version')) + '</td>')
-        [void]$sb.Append('<td>' + (Dash (XText $p 'descr')) + '</td>')
-        [void]$sb.Append('</tr>')
-    }
+    foreach ($p in $pkgs) { Add-Row $sb @((Dash (XText $p 'name')), (DashMono (XText $p 'version')), (Dash (XText $p 'descr'))) }
     return (Tbl @('Package','Version','Description') $sb.ToString() 'filterable-table')
 }
 
 function Build-Revision {
     param($root)
-    $rev = $root.SelectSingleNode('revision')
-    $lc  = XText $root 'lastchange'
+    $rev = $root.SelectSingleNode('revision'); $lc = XText $root 'lastchange'
     if ($null -eq $rev -and -not $lc) { return '' }
-    $sb = New-Object System.Text.StringBuilder
-    [void]$sb.Append('<div class="table-wrap"><table class="kv">')
+    $rows = New-Object 'System.Collections.Generic.List[object]'
     if ($null -ne $rev) {
-        [void]$sb.Append('<tr><th>Last change time</th><td>' + (DashMono (ConvertFrom-Epoch (XText $rev 'time'))) + '</td></tr>')
-        [void]$sb.Append('<tr><th>Description</th><td>' + (Dash (XText $rev 'description')) + '</td></tr>')
-        [void]$sb.Append('<tr><th>Changed by</th><td>' + (E-User (XText $rev 'username')) + '</td></tr>')
+        [void]$rows.Add(@('Last change time', (DashMono (ConvertFrom-Epoch (XText $rev 'time')))))
+        [void]$rows.Add(@('Description',      (Dash (XText $rev 'description'))))
+        [void]$rows.Add(@('Changed by',       (E-User (XText $rev 'username'))))
     }
-    if ($lc) {
-        [void]$sb.Append('<tr><th>lastchange</th><td>' + (DashMono (ConvertFrom-Epoch $lc)) + '</td></tr>')
-    }
-    [void]$sb.Append('</table></div>')
-    return $sb.ToString()
+    if ($lc) { [void]$rows.Add(@('lastchange', (DashMono (ConvertFrom-Epoch $lc)))) }
+    return (Format-KvTable $rows.ToArray())
 }
 
 function Build-Findings {
     if ($script:Findings.Count -eq 0) {
         return '<p class="all-clear">No automated risk flags were raised. (This is a heuristic scan, not a substitute for a full security review.)</p>'
     }
-    # Severity ordering: high first, then warn, then info.
     $sevRank = @{ 'high' = 0; 'warn' = 1; 'info' = 2 }
     $ordered = @($script:Findings | Sort-Object @{ Expression = { $sevRank[$_.Sev] } }, Label, Where)
+    $byKey   = @($ordered | Group-Object { $_.Sev + '|' + $_.Label } | Sort-Object @{ Expression = { $sevRank[$_.Group[0].Sev] } }, { $_.Group[0].Label })
 
-    # Counts (explicitly sorted by severity rank, then label)
-    $byKey = @($ordered | Group-Object { $_.Sev + '|' + $_.Label } | Sort-Object @{ Expression = { $sevRank[$_.Group[0].Sev] } }, { $_.Group[0].Label })
     $cards = New-Object System.Text.StringBuilder
     [void]$cards.Append('<div class="finding-cards" role="group" aria-label="Filter findings by type">')
     [void]$cards.Append('<button type="button" class="fcard fcard-all is-active" data-sev="all" data-label="all"><div class="fnum">' + $ordered.Count + '</div><div class="flbl">ALL FLAGS</div></button>')
     foreach ($g in $byKey) {
-        $sev = ($g.Group[0]).Sev
-        $lbl = ($g.Group[0]).Label
+        $sev = ($g.Group[0]).Sev; $lbl = ($g.Group[0]).Label
         [void]$cards.Append('<button type="button" class="fcard fcard-' + $sev + '" data-sev="' + $sev + '" data-label="' + [System.Net.WebUtility]::HtmlEncode($lbl) + '"><div class="fnum">' + $g.Count + '</div><div class="flbl">' + (E $lbl) + '</div></button>')
     }
     [void]$cards.Append('</div>')
 
     $sb = New-Object System.Text.StringBuilder
     foreach ($f in $ordered) {
-        $cls = switch ($f.Sev) { 'high' { 'badge-high' } 'warn' { 'badge-warn' } default { 'badge-info' } }
-        $locCell = if ($f.TargetId) {
-            '<a class="xref finding-jump" href="#' + $f.TargetId + '">' + (E $f.Where) + '</a>'
-        }
-        else {
-            E $f.Where
-        }
-        [void]$sb.Append('<tr data-sev="' + $f.Sev + '" data-label="' + [System.Net.WebUtility]::HtmlEncode($f.Label) + '">')
-        [void]$sb.Append('<td><span class="badge ' + $cls + '">' + (E $f.Label) + '</span></td>')
-        [void]$sb.Append('<td>' + $locCell + '</td>')
-        [void]$sb.Append('<td>' + (E $f.Detail) + '</td>')
-        [void]$sb.Append('</tr>')
+        $kind = switch ($f.Sev) { 'high' { 'high' } 'warn' { 'warn' } default { 'info' } }
+        $locCell = if ($f.TargetId) { '<a class="xref finding-jump" href="#' + $f.TargetId + '">' + (E $f.Where) + '</a>' } else { E $f.Where }
+        $extra = 'data-sev="' + $f.Sev + '" data-label="' + [System.Net.WebUtility]::HtmlEncode($f.Label) + '"'
+        Add-Row $sb -ExtraAttr $extra -Cells @((Badge $f.Label $kind), $locCell, (E $f.Detail))
     }
     return $cards.ToString() + (Tbl @('Flag','Location','Detail') $sb.ToString() 'findings-table filterable-table')
 }
@@ -2831,10 +2093,8 @@ a:hover{text-decoration:underline}
 .cards{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:20px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:13px 16px;min-width:118px;flex:1}
 .card .n{font-size:23px;font-weight:700;color:var(--brand2)}
-.card .n.sev-high{color:var(--high)}
-.card .n.sev-warn{color:var(--warn)}
-.card .n.sev-info{color:var(--info)}
-.card .n.sev-ok{color:var(--ok)}
+.card .n.sev-high{color:var(--high)} .card .n.sev-warn{color:var(--warn)}
+.card .n.sev-info{color:var(--info)} .card .n.sev-ok{color:var(--ok)}
 .card .l{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;margin-top:2px}
 
 /* Sections */
@@ -2862,8 +2122,7 @@ a:hover{text-decoration:underline}
 /* Tables */
 .table-wrap{overflow-x:auto;max-height:72vh;overflow-y:auto;border:1px solid var(--line);border-radius:8px;margin-bottom:10px}
 table{border-collapse:collapse;width:100%;font-size:13px}
-thead th{position:sticky;top:0;background:var(--brand);color:#fff;text-align:left;padding:8px 10px;font-weight:600;
-  white-space:nowrap;z-index:2}
+thead th{position:sticky;top:0;background:var(--brand);color:#fff;text-align:left;padding:8px 10px;font-weight:600;white-space:nowrap;z-index:2}
 tbody td{padding:7px 10px;border-top:1px solid var(--line);vertical-align:top}
 tbody tr:nth-child(even){background:var(--row-alt)}
 tbody tr:hover{background:var(--row-hover)}
@@ -2871,60 +2130,46 @@ table.kv th{position:static;background:var(--kv-bg);color:var(--ink);width:240px
 table.kv td{border-top:1px solid var(--line);padding:8px 10px}
 .wrapcell{max-width:360px;word-break:break-word}
 .flagcell{margin-top:4px;display:flex;flex-wrap:wrap;gap:4px}
-.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace;font-size:12px;
-  background:var(--code-bg);padding:1px 4px;border-radius:4px}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace;font-size:12px;background:var(--code-bg);padding:1px 4px;border-radius:4px}
 a.xref{border-bottom:1px dotted var(--brand2)}
 a.xref:hover{text-decoration:none;border-bottom-style:solid}
 
 /* Secret reveal */
 .secret-wrap{display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap}
 .secret-val.is-masked{filter:blur(5px);user-select:none}
-.secret-btn{font-size:11px;padding:1px 7px;border-radius:5px;border:1px solid var(--line);background:var(--panel-alt);
-  color:var(--ink);cursor:pointer}
+.secret-btn{font-size:11px;padding:1px 7px;border-radius:5px;border:1px solid var(--line);background:var(--panel-alt);color:var(--ink);cursor:pointer}
 .secret-btn:hover{background:var(--row-hover)}
 
-/* States */
-.row-disabled{opacity:.62}
-.row-disabled td{background:var(--panel-alt)}
-.row-high td{background:var(--high-bg) !important}
-.row-warn td{background:var(--warn-bg) !important}
+/* States & Badges */
+.row-disabled{opacity:.62} .row-disabled td{background:var(--panel-alt)}
+.row-high td{background:var(--high-bg) !important} .row-warn td{background:var(--warn-bg) !important}
 .row-hidden{display:none !important}
 .row-flash td{animation:flashRow 1.8s ease-out}
 @keyframes flashRow{0%{outline:2px solid var(--accent);background:var(--info-bg)}100%{outline:none}}
 .muted{color:var(--muted)}
 .redacted{color:var(--high);font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
 .note{font-size:12px;color:var(--muted);margin:6px 0 0}
-.not-configured{color:var(--muted);font-style:italic;background:var(--panel-alt);border:1px dashed var(--line);
-  padding:10px 14px;border-radius:8px;margin:0}
+.not-configured{color:var(--muted);font-style:italic;background:var(--panel-alt);border:1px dashed var(--line);padding:10px 14px;border-radius:8px;margin:0}
 .all-clear{color:var(--ok);background:var(--ok-bg);border:1px solid var(--ok-bd);padding:12px 16px;border-radius:8px}
-
-/* Badges */
-.badge{display:inline-block;padding:1px 7px;border-radius:11px;font-size:11px;font-weight:700;letter-spacing:.3px;
-  white-space:nowrap;line-height:1.6}
+.badge{display:inline-block;padding:1px 7px;border-radius:11px;font-size:11px;font-weight:700;letter-spacing:.3px;white-space:nowrap;line-height:1.6}
 .badge-high{background:var(--high-bg);color:var(--high);border:1px solid var(--high-bd)}
 .badge-warn{background:var(--warn-bg);color:var(--warn);border:1px solid var(--warn-bd)}
 .badge-ok{background:var(--ok-bg);color:var(--ok);border:1px solid var(--ok-bd)}
 .badge-info{background:var(--info-bg);color:var(--info);border:1px solid var(--info-bd)}
 .badge-muted{background:var(--muted-bg);color:var(--mutedb);border:1px solid var(--muted-bd)}
 
-/* Findings cards */
+/* Findings cards & Banners */
 .finding-cards{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:14px}
-.fcard{border-radius:10px;padding:10px 14px;min-width:118px;border:1px solid var(--line);background:var(--panel-alt);
-  text-align:left;cursor:pointer;font-family:inherit;color:var(--ink)}
-.fcard:hover{filter:brightness(.97)}
-.fcard.is-active{box-shadow:0 0 0 2px var(--accent)}
+.fcard{border-radius:10px;padding:10px 14px;min-width:118px;border:1px solid var(--line);background:var(--panel-alt);text-align:left;cursor:pointer;font-family:inherit;color:var(--ink)}
+.fcard:hover{filter:brightness(.97)} .fcard.is-active{box-shadow:0 0 0 2px var(--accent)}
 .fcard-high{background:var(--high-bg);border-color:var(--high-bd)}
 .fcard-warn{background:var(--warn-bg);border-color:var(--warn-bd)}
 .fcard-info{background:var(--info-bg);border-color:var(--info-bd)}
 .fcard .fnum{font-size:21px;font-weight:700}
 .fcard-high .fnum{color:var(--high)} .fcard-warn .fnum{color:var(--warn)} .fcard-info .fnum{color:var(--info)}
 .fcard .flbl{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.3px;margin-top:2px}
-
-/* Banners */
-.warn-banner{background:var(--warn-bg);border:1px solid var(--warn-bd);color:var(--warn);padding:12px 16px;border-radius:10px;
-  margin-bottom:16px;font-size:13px}
+.warn-banner{background:var(--warn-bg);border:1px solid var(--warn-bd);color:var(--warn);padding:12px 16px;border-radius:10px;margin-bottom:16px;font-size:13px}
 .warn-banner strong{color:var(--warn)}
-
 .footer{margin-top:28px;color:var(--muted);font-size:11px;text-align:center}
 
 @media (max-width:940px){
@@ -2932,7 +2177,6 @@ a.xref:hover{text-decoration:none;border-bottom-style:solid}
   .main{margin-left:0;padding:16px}
   .cards .card{min-width:96px}
 }
-
 @page{size:landscape;margin:12mm}
 @media print{
   :root,:root[data-theme="dark"]{
@@ -2962,178 +2206,123 @@ a.xref:hover{text-decoration:none;border-bottom-style:solid}
 '@
 
 $script:ReportJs = @'
-(function(){
+(() => {
   "use strict";
-  function setSectionCollapsed(sec, collapsed){
-    if(!sec){ return; }
+  const setCollapsed = (sec, collapsed) => {
+    if (!sec) return;
     sec.classList.toggle("collapsed", collapsed);
-    var btn = sec.querySelector(".section-header");
-    if(btn){ btn.setAttribute("aria-expanded", collapsed ? "false" : "true"); }
-  }
-  function setAll(collapsed){
-    var secs = document.querySelectorAll(".report-section");
-    for(var i = 0; i < secs.length; i++){ setSectionCollapsed(secs[i], collapsed); }
-  }
-  function openAndJump(targetId){
-    if(!targetId){ return; }
-    var el = document.getElementById(targetId);
-    if(!el){ return; }
-    var sec = el.classList.contains("report-section") ? el : el.closest(".report-section");
-    if(sec){ setSectionCollapsed(sec, false); }
+    const btn = sec.querySelector(".section-header");
+    if (btn) btn.setAttribute("aria-expanded", collapsed ? "false" : "true");
+  };
+  const setAll = (collapsed) => document.querySelectorAll(".report-section").forEach((s) => setCollapsed(s, collapsed));
+  const openAndJump = (id) => {
+    const el = id ? document.getElementById(id) : null;
+    if (!el) return;
+    setCollapsed(el.classList.contains("report-section") ? el : el.closest(".report-section"), false);
     el.scrollIntoView({ behavior: "smooth", block: "center" });
     el.classList.remove("row-flash");
     void el.offsetWidth;
     el.classList.add("row-flash");
-  }
+  };
 
-  document.addEventListener("DOMContentLoaded", function(){
-    // Section collapse/expand
-    var headers = document.querySelectorAll(".section-header");
-    for(var i = 0; i < headers.length; i++){
-      headers[i].addEventListener("click", function(){
-        var sec = this.closest(".report-section");
-        setSectionCollapsed(sec, !sec.classList.contains("collapsed"));
-      });
+  document.addEventListener("DOMContentLoaded", () => {
+    const rootEl   = document.documentElement;
+    const navLinks = [...document.querySelectorAll(".sidebar nav a")];
+    const allRows  = [...document.querySelectorAll("table.filterable-table tbody tr")];
+    const fRows    = [...document.querySelectorAll(".findings-table tbody tr")];
+    const btnTheme = document.getElementById("btn-theme");
+
+    if (btnTheme && window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) {
+      rootEl.setAttribute("data-theme", "dark");
+      btnTheme.textContent = "Light theme";
     }
 
-    // Sidebar tool buttons
-    var btnExp = document.getElementById("btn-expand-all");
-    if(btnExp){ btnExp.addEventListener("click", function(){ setAll(false); }); }
-    var btnCol = document.getElementById("btn-collapse-all");
-    if(btnCol){ btnCol.addEventListener("click", function(){ setAll(true); }); }
-    var btnPrt = document.getElementById("btn-print");
-    if(btnPrt){ btnPrt.addEventListener("click", function(){ window.print(); }); }
-    var btnTheme = document.getElementById("btn-theme");
-    if(btnTheme){
-      var rootEl = document.documentElement;
-      if(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches){
-        rootEl.setAttribute("data-theme", "dark");
-        btnTheme.textContent = "Light theme";
+    // Delegated click handler for sections, secrets, findings filter cards, cross-links & toolbar
+    document.addEventListener("click", (ev) => {
+      const hdr = ev.target.closest(".section-header");
+      if (hdr) { const sec = hdr.closest(".report-section"); setCollapsed(sec, !sec.classList.contains("collapsed")); return; }
+
+      const sBtn = ev.target.closest(".secret-btn");
+      if (sBtn && sBtn.previousElementSibling) {
+        const masked = sBtn.previousElementSibling.classList.toggle("is-masked");
+        sBtn.textContent = masked ? "Show" : "Hide";
+        return;
       }
-      btnTheme.addEventListener("click", function(){
-        var isDark = rootEl.getAttribute("data-theme") === "dark";
-        if(isDark){ rootEl.removeAttribute("data-theme"); this.textContent = "Dark theme"; }
-        else { rootEl.setAttribute("data-theme", "dark"); this.textContent = "Light theme"; }
-      });
-    }
 
-    // Secret click-to-reveal buttons
-    var sBtns = document.querySelectorAll(".secret-btn");
-    for(var s = 0; s < sBtns.length; s++){
-      sBtns[s].addEventListener("click", function(){
-        var val = this.previousElementSibling;
-        if(!val){ return; }
-        var masked = val.classList.toggle("is-masked");
-        this.textContent = masked ? "Show" : "Hide";
-      });
-    }
+      const card = ev.target.closest(".finding-cards .fcard");
+      if (card) {
+        document.querySelectorAll(".finding-cards .fcard").forEach((c) => c.classList.toggle("is-active", c === card));
+        const sev = card.getAttribute("data-sev");
+        const lbl = card.getAttribute("data-label");
+        fRows.forEach((r) => r.classList.toggle("row-hidden", sev !== "all" && (r.getAttribute("data-sev") !== sev || r.getAttribute("data-label") !== lbl)));
+        return;
+      }
 
-    // Hide-disabled toggles
-    var hdToggles = document.querySelectorAll(".hide-disabled-toggle");
-    for(var d = 0; d < hdToggles.length; d++){
-      hdToggles[d].addEventListener("change", function(){
-        var sec = document.getElementById(this.getAttribute("data-target"));
-        if(!sec){ return; }
-        var rows = sec.querySelectorAll('tr[data-disabled="1"]');
-        for(var r = 0; r < rows.length; r++){
-          rows[r].classList.toggle("row-hidden", this.checked);
-        }
-      });
-    }
+      const link = ev.target.closest('.sidebar nav a[href^="#"], a.xref[href^="#"]');
+      if (link) {
+        const href = link.getAttribute("href");
+        if (href && href.length > 1) { ev.preventDefault(); openAndJump(href.slice(1)); }
+        return;
+      }
 
-    // Findings card filter
-    var fCards = document.querySelectorAll(".finding-cards .fcard");
-    var fRows  = document.querySelectorAll(".findings-table tbody tr");
-    for(var c = 0; c < fCards.length; c++){
-      fCards[c].addEventListener("click", function(){
-        for(var j = 0; j < fCards.length; j++){ fCards[j].classList.remove("is-active"); }
-        this.classList.add("is-active");
-        var wantSev = this.getAttribute("data-sev");
-        var wantLbl = this.getAttribute("data-label");
-        for(var r = 0; r < fRows.length; r++){
-          var ok = (wantSev === "all") || (fRows[r].getAttribute("data-sev") === wantSev && fRows[r].getAttribute("data-label") === wantLbl);
-          fRows[r].classList.toggle("row-hidden", !ok);
-        }
-      });
-    }
+      const id = ev.target.id;
+      if (id === "btn-expand-all")   { setAll(false); }
+      else if (id === "btn-collapse-all") { setAll(true); }
+      else if (id === "btn-print")   { window.print(); }
+      else if (id === "btn-theme")   {
+        const isDark = rootEl.getAttribute("data-theme") === "dark";
+        if (isDark) { rootEl.removeAttribute("data-theme"); ev.target.textContent = "Dark theme"; }
+        else        { rootEl.setAttribute("data-theme", "dark"); ev.target.textContent = "Light theme"; }
+      }
+      else if (id === "global-search-clear" && gInput) { gInput.value = ""; runSearch(); gInput.focus(); }
+    });
 
-    // Auto-expand collapsed sections on sidebar/cross-link clicks
-    var xLinks = document.querySelectorAll('.sidebar nav a[href^="#"], a.xref[href^="#"]');
-    for(var x = 0; x < xLinks.length; x++){
-      xLinks[x].addEventListener("click", function(ev){
-        var href = this.getAttribute("href");
-        if(href && href.length > 1){
-          ev.preventDefault();
-          openAndJump(href.substring(1));
-        }
-      });
-    }
+    // Delegated change handler for hide-disabled toggles
+    document.addEventListener("change", (ev) => {
+      if (!ev.target.classList.contains("hide-disabled-toggle")) return;
+      const sec = document.getElementById(ev.target.getAttribute("data-target"));
+      if (sec) sec.querySelectorAll('tr[data-disabled="1"]').forEach((r) => r.classList.toggle("row-hidden", ev.target.checked));
+    });
 
     // Sidebar section filter
-    var navLinks = [].slice.call(document.querySelectorAll(".sidebar nav a"));
-    var nf = document.getElementById("navfilter");
-    if(nf){
-      nf.addEventListener("input", function(){
-        var q = this.value.toLowerCase();
-        for(var i = 0; i < navLinks.length; i++){
-          navLinks[i].style.display = navLinks[i].textContent.toLowerCase().indexOf(q) > -1 ? "" : "none";
-        }
-      });
-    }
+    const nf = document.getElementById("navfilter");
+    if (nf) nf.addEventListener("input", () => {
+      const q = nf.value.toLowerCase();
+      navLinks.forEach((a) => { a.style.display = a.textContent.toLowerCase().includes(q) ? "" : "none"; });
+    });
 
     // Global table row search
-    var gInput  = document.getElementById("global-search");
-    var gStatus = document.getElementById("global-search-status");
-    var gClear  = document.getElementById("global-search-clear");
-    var allRows = [].slice.call(document.querySelectorAll("table.filterable-table tbody tr"));
-    function runSearch(){
-      if(!gInput){ return; }
-      var q = gInput.value.trim().toLowerCase();
-      var shown = 0;
-      for(var i = 0; i < allRows.length; i++){
-        if(!q){
-          allRows[i].classList.remove("row-hidden");
-          shown++;
-        }
-        else {
-          var match = allRows[i].textContent.toLowerCase().indexOf(q) > -1;
-          allRows[i].classList.toggle("row-hidden", !match);
-          if(match){ shown++; }
-        }
-      }
-      if(gStatus){ gStatus.textContent = q ? (shown + " matching row" + (shown === 1 ? "" : "s")) : ""; }
-    }
-    if(gInput){ gInput.addEventListener("input", runSearch); }
-    if(gClear){ gClear.addEventListener("click", function(){ if(gInput){ gInput.value = ""; runSearch(); gInput.focus(); } }); }
+    const gInput  = document.getElementById("global-search");
+    const gStatus = document.getElementById("global-search-status");
+    const runSearch = () => {
+      if (!gInput) return;
+      const q = gInput.value.trim().toLowerCase();
+      let shown = 0;
+      allRows.forEach((r) => {
+        const match = !q || r.textContent.toLowerCase().includes(q);
+        r.classList.toggle("row-hidden", !match);
+        if (match) shown++;
+      });
+      if (gStatus) gStatus.textContent = q ? `${shown} matching row${shown === 1 ? "" : "s"}` : "";
+    };
+    if (gInput) gInput.addEventListener("input", runSearch);
 
     // Scroll-spy with rAF + passive listener + bottom-of-page handling
-    var secs = [];
-    for(var k = 0; k < navLinks.length; k++){
-      var el = document.querySelector(navLinks[k].getAttribute("href"));
-      if(el){ secs.push(el); }
-    }
-    var ticking = false;
-    function updateActiveNav(){
+    const secs = navLinks.map((a) => document.querySelector(a.getAttribute("href"))).filter(Boolean);
+    let ticking = false;
+    const updateActiveNav = () => {
       ticking = false;
-      var pos = window.pageYOffset + 130;
-      var atBottom = (window.innerHeight + window.pageYOffset) >= (document.documentElement.scrollHeight - 20);
-      var cur = null;
-      if(atBottom && secs.length > 0){ cur = secs[secs.length - 1]; }
-      else {
-        for(var i = 0; i < secs.length; i++){ if(secs[i].offsetTop <= pos){ cur = secs[i]; } }
-      }
-      for(var j = 0; j < navLinks.length; j++){
-        var on = cur && navLinks[j].getAttribute("href") === ("#" + cur.id);
-        navLinks[j].classList.toggle("active", !!on);
-      }
-    }
-    window.addEventListener("scroll", function(){
-      if(!ticking){ ticking = true; window.requestAnimationFrame(updateActiveNav); }
-    }, { passive: true });
+      const pos = window.pageYOffset + 130;
+      const atBottom = (window.innerHeight + window.pageYOffset) >= (document.documentElement.scrollHeight - 20);
+      let cur = atBottom && secs.length ? secs[secs.length - 1] : null;
+      if (!cur) secs.forEach((s) => { if (s.offsetTop <= pos) cur = s; });
+      navLinks.forEach((a) => a.classList.toggle("active", Boolean(cur && a.getAttribute("href") === `#${cur.id}`)));
+    };
+    window.addEventListener("scroll", () => { if (!ticking) { ticking = true; requestAnimationFrame(updateActiveNav); } }, { passive: true });
     updateActiveNav();
   });
 
-  window.addEventListener("beforeprint", function(){ setAll(false); });
+  window.addEventListener("beforeprint", () => setAll(false));
 })();
 '@
 
@@ -3143,132 +2332,103 @@ $script:ReportJs = @'
 
 function Invoke-PfSenseReport {
     param(
-        [string]$ConfigPathValue,
-        [string]$OutputPathValue,
-        [bool]$RedactValue,
-        [string]$TitleValue,
-        [string]$LogoPathValue,
-        [string[]]$WanInterfacesValue,
-        [string[]]$InternalInterfacesValue,
-        [int]$ExpiryWarnDaysValue,
-        [string]$JsonPathValue,
-        [bool]$QuietValue
+        [string]$ConfigPathValue, [string]$OutputPathValue, [bool]$RedactValue,
+        [string]$TitleValue, [string]$LogoPathValue,
+        [string[]]$WanInterfacesValue, [string[]]$InternalInterfacesValue,
+        [int]$ExpiryWarnDaysValue, [string]$JsonPathValue, [bool]$QuietValue
     )
 
     Initialize-ReportContext -RedactMode $RedactValue -ExpiryWarnDaysValue $ExpiryWarnDaysValue
-
     if ([string]::IsNullOrWhiteSpace($ConfigPathValue)) {
         throw "ConfigPath is required. Example: .\pfsense_report.ps1 -ConfigPath config.xml"
     }
 
-    # ---- Load and validate XML -----------------------------------------------
     $resolvedConfig = Resolve-FullPath $ConfigPathValue
-    $xml = Read-PfSenseXml $ConfigPathValue
+    $xml  = Read-PfSenseXml $ConfigPathValue
     $root = $xml.DocumentElement
     if ($null -eq $root -or $root.Name -ne 'pfsense') {
         throw "This does not appear to be a pfSense configuration (missing <pfsense> root element)."
     }
 
-    # ---- Default output path -------------------------------------------------
     if ([string]::IsNullOrWhiteSpace($OutputPathValue)) {
-        $base = [System.IO.Path]::GetFileNameWithoutExtension($resolvedConfig)
-        $OutputPathValue = Join-Path (Get-Location).Path ($base + '-report.html')
+        $OutputPathValue = Join-Path (Get-Location).Path (([System.IO.Path]::GetFileNameWithoutExtension($resolvedConfig)) + '-report.html')
     }
     $resolvedOutput = Resolve-FullPath $OutputPathValue
 
-    # ---- Gather metadata -----------------------------------------------------
-    $sysNode  = $root.SelectSingleNode('system')
-    $hostname = XText $sysNode 'hostname'
-    $domain   = XText $sysNode 'domain'
-    $version  = XText $root 'version'
-    $script:RedactHost   = $hostname
-    $script:RedactDomain = $domain
+    $sysNode = $root.SelectSingleNode('system')
+    $hostname = XText $sysNode 'hostname'; $domain = XText $sysNode 'domain'; $version = XText $root 'version'
+    $script:RedactHost = $hostname; $script:RedactDomain = $domain
 
-    # ---- Build lookup maps ---------------------------------------------------
     Build-LookupMaps -root $root -ForceWan $WanInterfacesValue -ForceInternal $InternalInterfacesValue
 
-    # ---- Build sections (risk-bearing sections first to populate findings) ---
-    $sysHtml      = Build-System           $root
-    $ifHtml       = Build-Interfaces       $root
-    $ifGrpHtml    = Build-IfGroupsAndL2    $root
-    $vlanHtml     = Build-Vlans            $root
-    $vipHtml      = Build-VirtualIps       $root
-    $gwHtml       = Build-Gateways         $root
-    $routeHtml    = Build-Routes           $root
-    $fwHtml       = Build-Firewall         $root
-    $natHtml      = Build-Nat              $root
-    $ipsecHtml    = Build-Ipsec            $root
-    $ovpnHtml     = Build-OpenVpn          $root
-    $wgHtml       = Build-WireGuard        $root
-    $haHtml       = Build-HighAvailability $root
-    $dhcpHtml     = Build-Dhcp             $root
-    $dnsHtml      = Build-Dns              $root
-    $certHtml     = Build-Certs            $root
-    $userHtml     = Build-Users            $root
-    $aliasHtml    = Build-Aliases          $root
-    $svcHtml      = Build-Services         $root
-    $pkgHtml      = Build-Packages         $root
-    $revHtml      = Build-Revision         $root
-    $findHtml     = Build-Findings
-
-    # ---- Counts for cover & sidebar ------------------------------------------
+    # ---- Inventory counts ----------------------------------------------------
     $ifsNode = $root.SelectSingleNode('interfaces')
-    $cIf     = (XNodes $ifsNode '*').Count
-    $cVlan   = (XNodes $root 'vlans/vlan').Count
-    $cVip    = (XNodes $root 'virtualip/vip').Count
-    $cGw     = (XNodes $root 'gateways/gateway_item').Count + (XNodes $root 'gateways/gateway_group').Count
-    $cRoute  = (XNodes $root 'staticroutes/route').Count
-    $cFw     = (XNodes $root 'filter/rule').Count
-    $cPf     = (XNodes $root 'nat/rule').Count
-    $cNat    = $cPf + (XNodes $root 'nat/outbound/rule').Count + (XNodes $root 'nat/onetoone').Count
-    $cP1     = (XNodes $root 'ipsec/phase1').Count
-    $cOv     = (XNodes $root 'openvpn/openvpn-server').Count + (XNodes $root 'openvpn/openvpn-client').Count
-    $cWg     = (XNodes $root 'installedpackages/wireguard/tunnels/item').Count + (XNodes $root 'wireguard/tunnels/item').Count
-    $cCert   = (XNodes $root 'cert').Count + (XNodes $root 'ca').Count
-    $cUser   = (XNodes $root 'system/user').Count
-    $cAlias  = (XNodes $root 'aliases/alias').Count
-    $cPkg    = (XNodes $root 'installedpackages/package').Count
-    $cFind   = $script:Findings.Count
+    $counts = @{
+        interfaces    = (XNodes $ifsNode '*').Count
+        vlans         = (XNodes $root 'vlans/vlan').Count
+        virtualIps    = (XNodes $root 'virtualip/vip').Count
+        gateways      = (XNodes $root 'gateways/gateway_item').Count + (XNodes $root 'gateways/gateway_group').Count
+        staticRoutes  = (XNodes $root 'staticroutes/route').Count
+        firewallRules = (XNodes $root 'filter/rule').Count
+        portForwards  = (XNodes $root 'nat/rule').Count
+        natTotal      = (XNodes $root 'nat/rule').Count + (XNodes $root 'nat/outbound/rule').Count + (XNodes $root 'nat/onetoone').Count
+        ipsecTunnels  = (XNodes $root 'ipsec/phase1').Count
+        openVpn       = (XNodes $root 'openvpn/openvpn-server').Count + (XNodes $root 'openvpn/openvpn-client').Count
+        wireGuard     = (XNodes $root 'installedpackages/wireguard/tunnels/item').Count + (XNodes $root 'wireguard/tunnels/item').Count
+        certsAndCas   = (XNodes $root 'cert').Count + (XNodes $root 'ca').Count
+        users         = (XNodes $root 'system/user').Count
+        aliases       = (XNodes $root 'aliases/alias').Count
+        packages      = (XNodes $root 'installedpackages/package').Count
+    }
+
+    # ---- Data-driven section registry (non-findings built first to populate findings)
+    $sectionDefs = @(
+        @{ Id='findings';   Nav='Security Findings';        Title='Security Findings';                     Summary='Heuristic risk flags raised while parsing this configuration.';                                                                  CountKey='findings';      Builder=$null },
+        @{ Id='system';     Nav='System Overview';          Title='System Overview';                       Summary='Core system services: DNS, NTP, time zone, WebGUI security, SSH and console protection.';                                        CountKey=$null;           Builder={ param($r) Build-System $r } },
+        @{ Id='interfaces'; Nav='Interfaces';               Title='Interfaces';                            Summary='Every configured interface and its addressing, VLAN and filtering options.';                                                     CountKey='interfaces';    Builder={ param($r) Build-Interfaces $r } },
+        @{ Id='ifgroups';   Nav='Groups / LAGGs / Bridges'; Title='Interface Groups, LAGGs &amp; Bridges'; Summary='Logical interface groups, link aggregations (LAGG), and Layer-2 bridges.';                                                       CountKey=$null;           Builder={ param($r) Build-IfGroupsAndL2 $r } },
+        @{ Id='vlans';      Nav='VLANs';                    Title='VLANs';                                 Summary='IEEE 802.1Q VLANs defined on physical interfaces.';                                                                              CountKey='vlans';         Builder={ param($r) Build-Vlans $r } },
+        @{ Id='vips';       Nav='Virtual IPs';              Title='Virtual IPs';                           Summary='CARP, IP Alias, Proxy ARP and other virtual IP addresses.';                                                                      CountKey='virtualIps';    Builder={ param($r) Build-VirtualIps $r } },
+        @{ Id='gateways';   Nav='Gateways';                 Title='Gateways &amp; Groups';                 Summary='Upstream gateways, default route selections, and multi-WAN gateway groups.';                                                     CountKey='gateways';      Builder={ param($r) Build-Gateways $r } },
+        @{ Id='routes';     Nav='Static Routes';            Title='Static Routes';                         Summary='Manually configured static routes to remote networks.';                                                                          CountKey='staticRoutes';  Builder={ param($r) Build-Routes $r } },
+        @{ Id='firewall';   Nav='Firewall Rules';           Title='Firewall Rules';                        Summary='Packet-filter rules grouped by interface (floating first), with risk flags highlighted.';                                        CountKey='firewallRules'; Builder={ param($r) Build-Firewall $r } },
+        @{ Id='nat';        Nav='NAT';                      Title='NAT';                                   Summary='Outbound NAT mode and rules, port forwards, and 1:1 NAT mappings.';                                                              CountKey='natTotal';      Builder={ param($r) Build-Nat $r } },
+        @{ Id='ipsec';      Nav='VPN - IPsec';              Title='VPN &mdash; IPsec';                     Summary='IPsec tunnels: Phase 1 (IKE) peers and Phase 2 (child SA) tunnel networks.';                                                     CountKey='ipsecTunnels';  Builder={ param($r) Build-Ipsec $r } },
+        @{ Id='openvpn';    Nav='VPN - OpenVPN';            Title='VPN &mdash; OpenVPN';                   Summary='OpenVPN server and client instances and their cryptographic settings.';                                                          CountKey='openVpn';       Builder={ param($r) Build-OpenVpn $r } },
+        @{ Id='wireguard';  Nav='VPN - WireGuard';          Title='VPN &mdash; WireGuard';                 Summary='WireGuard tunnels and peers. Private and preshared keys are never exported.';                                                    CountKey='wireGuard';     Builder={ param($r) Build-WireGuard $r } },
+        @{ Id='ha';         Nav='High Availability';        Title='High Availability (CARP / Sync)';       Summary='pfsync state synchronization and XMLRPC configuration sync settings.';                                                           CountKey=$null;           Builder={ param($r) Build-HighAvailability $r } },
+        @{ Id='dhcp';       Nav='DHCP Servers';             Title='DHCP Servers &amp; Relay';              Summary='Per-interface DHCPv4/DHCPv6 scopes, pools, static reservations, and relay settings.';                                            CountKey=$null;           Builder={ param($r) Build-Dhcp $r } },
+        @{ Id='dns';        Nav='DNS Resolver / Forwarder'; Title='DNS Resolver / Forwarder';              Summary='Unbound resolver and dnsmasq forwarder settings and overrides.';                                                                 CountKey=$null;           Builder={ param($r) Build-Dns $r } },
+        @{ Id='certs';      Nav='Certificates & CAs';       Title='Certificates, CAs &amp; CRLs';          Summary='Certificate authorities, certificates, and CRLs with expiry, key/signature analysis, and usage context.';                        CountKey='certsAndCas';   Builder={ param($r) Build-Certs $r } },
+        @{ Id='users';      Nav='Users & Groups';           Title='Users, Groups &amp; Auth';              Summary='Local user accounts, groups, and external LDAP/RADIUS servers. Hashes and secrets are never exported.';                          CountKey='users';         Builder={ param($r) Build-Users $r } },
+        @{ Id='aliases';    Nav='Aliases';                  Title='Aliases';                               Summary='Reusable host, network, port and URL aliases referenced by rules.';                                                              CountKey='aliases';       Builder={ param($r) Build-Aliases $r } },
+        @{ Id='services';   Nav='Services (SNMP / Syslog)'; Title='System Services';                       Summary='SNMP, remote Syslog, Dynamic DNS, and firewall schedules.';                                                                      CountKey=$null;           Builder={ param($r) Build-Services $r } },
+        @{ Id='packages';   Nav='Installed Packages';       Title='Installed Packages';                    Summary='Add-on packages installed on this firewall.';                                                                                    CountKey='packages';      Builder={ param($r) Build-Packages $r } },
+        @{ Id='revision';   Nav='Revision / Notes';         Title='Revision / Notes';                      Summary='Metadata about the most recent configuration change.';                                                                           CountKey=$null;           Builder={ param($r) Build-Revision $r } }
+    )
+
+    foreach ($sd in $sectionDefs) {
+        if ($null -ne $sd.Builder) { $sd.Body = & $sd.Builder $root }
+    }
+    $sectionDefs[0].Body = Build-Findings
+
+    $cFind     = $script:Findings.Count
     $highCount = @($script:Findings | Where-Object { $_.Sev -eq 'high' }).Count
     $warnCount = @($script:Findings | Where-Object { $_.Sev -eq 'warn' }).Count
     $infoCount = @($script:Findings | Where-Object { $_.Sev -eq 'info' }).Count
-
-    # ---- Assemble sections ---------------------------------------------------
-    $sectionDefs = @(
-        @{ Id='findings';   Nav='Security Findings';        Title='Security Findings';        Summary='Heuristic risk flags raised while parsing this configuration.'; Body=$findHtml; Count=$cFind },
-        @{ Id='system';     Nav='System Overview';          Title='System Overview';          Summary='Core system services: DNS, NTP, time zone, WebGUI security, SSH and console protection.'; Body=$sysHtml; Count=$null },
-        @{ Id='interfaces'; Nav='Interfaces';               Title='Interfaces';               Summary='Every configured interface and its addressing, VLAN and filtering options.'; Body=$ifHtml; Count=$cIf },
-        @{ Id='ifgroups';   Nav='Groups / LAGGs / Bridges'; Title='Interface Groups, LAGGs &amp; Bridges'; Summary='Logical interface groups, link aggregations (LAGG), and Layer-2 bridges.'; Body=$ifGrpHtml; Count=$null },
-        @{ Id='vlans';      Nav='VLANs';                    Title='VLANs';                    Summary='IEEE 802.1Q VLANs defined on physical interfaces.'; Body=$vlanHtml; Count=$cVlan },
-        @{ Id='vips';       Nav='Virtual IPs';              Title='Virtual IPs';              Summary='CARP, IP Alias, Proxy ARP and other virtual IP addresses.'; Body=$vipHtml; Count=$cVip },
-        @{ Id='gateways';   Nav='Gateways';                 Title='Gateways &amp; Groups';    Summary='Upstream gateways, default route selections, and multi-WAN gateway groups.'; Body=$gwHtml; Count=$cGw },
-        @{ Id='routes';     Nav='Static Routes';            Title='Static Routes';            Summary='Manually configured static routes to remote networks.'; Body=$routeHtml; Count=$cRoute },
-        @{ Id='firewall';   Nav='Firewall Rules';           Title='Firewall Rules';           Summary='Packet-filter rules grouped by interface (floating first), with risk flags highlighted.'; Body=$fwHtml; Count=$cFw },
-        @{ Id='nat';        Nav='NAT';                      Title='NAT';                      Summary='Outbound NAT mode and rules, port forwards, and 1:1 NAT mappings.'; Body=$natHtml; Count=$cNat },
-        @{ Id='ipsec';      Nav='VPN - IPsec';              Title='VPN &mdash; IPsec';        Summary='IPsec tunnels: Phase 1 (IKE) peers and Phase 2 (child SA) tunnel networks.'; Body=$ipsecHtml; Count=$cP1 },
-        @{ Id='openvpn';    Nav='VPN - OpenVPN';            Title='VPN &mdash; OpenVPN';      Summary='OpenVPN server and client instances and their cryptographic settings.'; Body=$ovpnHtml; Count=$cOv },
-        @{ Id='wireguard';  Nav='VPN - WireGuard';          Title='VPN &mdash; WireGuard';    Summary='WireGuard tunnels and peers. Private and preshared keys are never exported.'; Body=$wgHtml; Count=$cWg },
-        @{ Id='ha';         Nav='High Availability';        Title='High Availability (CARP / Sync)'; Summary='pfsync state synchronization and XMLRPC configuration sync settings.'; Body=$haHtml; Count=$null },
-        @{ Id='dhcp';       Nav='DHCP Servers';             Title='DHCP Servers &amp; Relay'; Summary='Per-interface DHCPv4/DHCPv6 scopes, pools, static reservations, and relay settings.'; Body=$dhcpHtml; Count=$null },
-        @{ Id='dns';        Nav='DNS Resolver / Forwarder'; Title='DNS Resolver / Forwarder'; Summary='Unbound resolver and dnsmasq forwarder settings and overrides.'; Body=$dnsHtml; Count=$null },
-        @{ Id='certs';      Nav='Certificates & CAs';       Title='Certificates, CAs &amp; CRLs'; Summary='Certificate authorities, certificates, and CRLs with expiry, key/signature analysis, and usage context.'; Body=$certHtml; Count=$cCert },
-        @{ Id='users';      Nav='Users & Groups';           Title='Users, Groups &amp; Auth'; Summary='Local user accounts, groups, and external LDAP/RADIUS servers. Hashes and secrets are never exported.'; Body=$userHtml; Count=$cUser },
-        @{ Id='aliases';    Nav='Aliases';                  Title='Aliases';                  Summary='Reusable host, network, port and URL aliases referenced by rules.'; Body=$aliasHtml; Count=$cAlias },
-        @{ Id='services';   Nav='Services (SNMP / Syslog)'; Title='System Services';          Summary='SNMP, remote Syslog, Dynamic DNS, and firewall schedules.'; Body=$svcHtml; Count=$null },
-        @{ Id='packages';   Nav='Installed Packages';       Title='Installed Packages';       Summary='Add-on packages installed on this firewall.'; Body=$pkgHtml; Count=$cPkg },
-        @{ Id='revision';   Nav='Revision / Notes';         Title='Revision / Notes';         Summary='Metadata about the most recent configuration change.'; Body=$revHtml; Count=$null }
-    )
+    $counts['findings'] = $cFind
 
     $sectionsSb = New-Object System.Text.StringBuilder
     $navSb      = New-Object System.Text.StringBuilder
     foreach ($sd in $sectionDefs) {
         [void]$sectionsSb.Append((Wrap-Section $sd.Id $sd.Title $sd.Summary $sd.Body))
         $emptyCls = if ([string]::IsNullOrWhiteSpace($sd.Body)) { ' class="nav-empty"' } else { '' }
-        $cntBadge = if ($null -ne $sd.Count -and $sd.Count -gt 0) { '<span class="nav-cnt">' + $sd.Count + '</span>' } else { '' }
+        $cntVal   = if ($sd.CountKey) { $counts[$sd.CountKey] } else { 0 }
+        $cntBadge = if ($cntVal -gt 0) { '<span class="nav-cnt">' + $cntVal + '</span>' } else { '' }
         [void]$navSb.Append('<a href="#' + $sd.Id + '"' + $emptyCls + '><span>' + [System.Net.WebUtility]::HtmlEncode($sd.Nav) + '</span>' + $cntBadge + '</a>')
     }
 
-    # ---- Banners (Version & Plaintext Secrets) -------------------------------
+    # ---- Banners & Stat Cards ------------------------------------------------
     $banners = New-Object System.Text.StringBuilder
     $verMajor = 0.0
     $verOk = [double]::TryParse($version, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$verMajor)
@@ -3282,38 +2442,34 @@ function Invoke-PfSenseReport {
         [void]$banners.Append('<div class="warn-banner"><strong>Confidentiality Notice:</strong> This report contains unredacted secrets (such as IPsec pre-shared keys or SNMP communities, hidden behind click-to-reveal). Treat this file as sensitive, or re-run with <code class="mono">-Redact</code> before sharing externally.</div>')
     }
 
-    # ---- Stat cards ----------------------------------------------------------
     $riskCls = if ($highCount -gt 0) { 'sev-high' } elseif ($warnCount -gt 0) { 'sev-warn' } elseif ($infoCount -gt 0) { 'sev-info' } else { 'sev-ok' }
+    $statItems = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($st in @(
+        @($counts.interfaces,    'Interfaces',     ''),
+        @($counts.firewallRules, 'Firewall rules', ''),
+        @($counts.portForwards,  'Port forwards',  ''),
+        @($counts.ipsecTunnels,  'IPsec tunnels',  ''),
+        @($counts.openVpn,       'OpenVPN',        '')
+    )) { [void]$statItems.Add($st) }
+    if ($counts.wireGuard -gt 0) { [void]$statItems.Add(@($counts.wireGuard, 'WireGuard', '')) }
+    [void]$statItems.Add(@($counts.certsAndCas, 'Certs / CAs', ''))
+    [void]$statItems.Add(@($cFind,              'Risk flags',  $riskCls))
+
     $cardsSb = New-Object System.Text.StringBuilder
     [void]$cardsSb.Append('<div class="cards">')
-    [void]$cardsSb.Append('<div class="card"><div class="n">' + $cIf + '</div><div class="l">Interfaces</div></div>')
-    [void]$cardsSb.Append('<div class="card"><div class="n">' + $cFw + '</div><div class="l">Firewall rules</div></div>')
-    [void]$cardsSb.Append('<div class="card"><div class="n">' + $cPf + '</div><div class="l">Port forwards</div></div>')
-    [void]$cardsSb.Append('<div class="card"><div class="n">' + $cP1 + '</div><div class="l">IPsec tunnels</div></div>')
-    [void]$cardsSb.Append('<div class="card"><div class="n">' + $cOv + '</div><div class="l">OpenVPN</div></div>')
-    if ($cWg -gt 0) {
-        [void]$cardsSb.Append('<div class="card"><div class="n">' + $cWg + '</div><div class="l">WireGuard</div></div>')
+    foreach ($st in $statItems) {
+        $nCls = if ($st[2]) { 'n ' + $st[2] } else { 'n' }
+        [void]$cardsSb.Append('<div class="card"><div class="' + $nCls + '">' + $st[0] + '</div><div class="l">' + $st[1] + '</div></div>')
     }
-    [void]$cardsSb.Append('<div class="card"><div class="n">' + $cCert + '</div><div class="l">Certs / CAs</div></div>')
-    [void]$cardsSb.Append('<div class="card"><div class="n ' + $riskCls + '">' + $cFind + '</div><div class="l">Risk flags</div></div>')
     [void]$cardsSb.Append('</div>')
 
-    # ---- Cover ---------------------------------------------------------------
-    $logoTag = Get-LogoTag $LogoPathValue
-    $genTime = $script:Now.ToString('yyyy-MM-dd HH:mm:ss zzz')
-    $hostDisp = if ($script:IsRedacted) {
-        if ($hostname) { Get-RedactToken $hostname.ToLowerInvariant() 'HOST' } else { 'unknown' }
-    } else {
-        if ($hostname) { $hostname } else { 'unknown' }
-    }
-    $domDisp = if ($script:IsRedacted) {
-        if ($domain) { Get-RedactToken $domain.ToLowerInvariant() 'DOMAIN' } else { '' }
-    } else {
-        if ($domain) { $domain } else { '' }
-    }
-    $fqdn = if ($domDisp) { $hostDisp + '.' + $domDisp } else { $hostDisp }
+    # ---- Cover, Sidebar, Search & Final HTML ---------------------------------
+    $genTime  = $script:Now.ToString('yyyy-MM-dd HH:mm:ss zzz')
+    $hostDisp = if (-not $hostname) { 'unknown' } elseif ($script:IsRedacted) { Get-RedactToken $hostname.ToLowerInvariant() 'HOST' } else { $hostname }
+    $domDisp  = if (-not $domain)   { '' }        elseif ($script:IsRedacted) { Get-RedactToken $domain.ToLowerInvariant() 'DOMAIN' } else { $domain }
+    $fqdn     = if ($domDisp) { "$hostDisp.$domDisp" } else { $hostDisp }
 
-    $cover = '<div class="cover"><div class="cover-top">' + $logoTag +
+    $cover = '<div class="cover"><div class="cover-top">' + (Get-LogoTag $LogoPathValue) +
              '<div><h1>' + (E $TitleValue) + '</h1><div class="sub">Generated by pfsense_report.ps1 v' + $script:ToolVersion + $(if ($script:IsRedacted) { ' &mdash; REDACTED COPY' } else { '' }) + '</div></div></div>' +
              '<div class="meta">' +
              '<div><span>Hostname</span><strong>' + [System.Net.WebUtility]::HtmlEncode($fqdn) + '</strong></div>' +
@@ -3322,21 +2478,13 @@ function Invoke-PfSenseReport {
              '<div><span>Source file</span><strong>' + $(if ($script:IsRedacted) { '[redacted]' } else { [System.Net.WebUtility]::HtmlEncode([System.IO.Path]::GetFileName($resolvedConfig)) }) + '</strong></div>' +
              '</div></div>'
 
-    # ---- Sidebar & Search Bar ------------------------------------------------
-    $sidebarBrand = if ($script:IsRedacted) {
-        if ($hostname) { [System.Net.WebUtility]::HtmlEncode((Get-RedactToken $hostname.ToLowerInvariant() 'HOST')) } else { '' }
-    } else {
-        [System.Net.WebUtility]::HtmlEncode($hostname)
-    }
+    $sidebarBrand = if (-not $hostname) { '' } elseif ($script:IsRedacted) { [System.Net.WebUtility]::HtmlEncode((Get-RedactToken $hostname.ToLowerInvariant() 'HOST')) } else { [System.Net.WebUtility]::HtmlEncode($hostname) }
     $sidebar = '<aside class="sidebar"><div class="brand">pfSense Report<small>' + $sidebarBrand + '</small></div>' +
                '<label for="navfilter" class="sr-only">Filter sections</label>' +
                '<input id="navfilter" class="navfilter" type="search" placeholder="Filter sections..." aria-label="Filter sections" />' +
-               '<div class="navtools">' +
-               '<button type="button" id="btn-expand-all">Expand all</button>' +
-               '<button type="button" id="btn-collapse-all">Collapse all</button>' +
-               '<button type="button" id="btn-print">Print / PDF</button>' +
-               '<button type="button" id="btn-theme">Dark theme</button>' +
-               '</div><nav aria-label="Report sections">' + $navSb.ToString() + '</nav></aside>'
+               '<div class="navtools"><button type="button" id="btn-expand-all">Expand all</button><button type="button" id="btn-collapse-all">Collapse all</button>' +
+               '<button type="button" id="btn-print">Print / PDF</button><button type="button" id="btn-theme">Dark theme</button></div>' +
+               '<nav aria-label="Report sections">' + $navSb.ToString() + '</nav></aside>'
 
     $searchBar = '<div class="search-bar"><label for="global-search" class="sr-only">Search report tables</label>' +
                  '<input id="global-search" type="search" placeholder="Search rules, IPs, ports, aliases, hosts, packages..." aria-label="Search report tables" />' +
@@ -3344,38 +2492,21 @@ function Invoke-PfSenseReport {
                  '<button type="button" id="global-search-clear">Clear</button></div>'
 
     $footer = '<div class="footer">Generated locally by pfsense_report.ps1 v' + $script:ToolVersion + ' &mdash; no data left this machine. Heuristic risk flags are informational and do not replace a manual security review.</div>'
+    $csp    = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline';"
 
-    # ---- Final HTML document -------------------------------------------------
-    $csp = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline';"
     $docSb = New-Object System.Text.StringBuilder
-    [void]$docSb.Append('<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">')
-    [void]$docSb.Append('<meta name="viewport" content="width=device-width, initial-scale=1">')
-    [void]$docSb.Append('<meta name="color-scheme" content="light dark">')
-    [void]$docSb.Append('<meta http-equiv="Content-Security-Policy" content="' + $csp + '">')
+    [void]$docSb.Append('<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">')
+    [void]$docSb.Append('<meta name="color-scheme" content="light dark"><meta http-equiv="Content-Security-Policy" content="' + $csp + '">')
     [void]$docSb.Append('<title>' + (E $TitleValue) + '</title><style>' + $script:ReportCss + '</style></head><body>')
-    [void]$docSb.Append('<a class="skip-link" href="#main-content">Skip to report content</a>')
-    [void]$docSb.Append($sidebar)
-    [void]$docSb.Append('<main id="main-content" class="main">')
-    [void]$docSb.Append($cover).Append($banners.ToString()).Append($cardsSb.ToString()).Append($searchBar).Append($sectionsSb.ToString()).Append($footer)
+    [void]$docSb.Append('<a class="skip-link" href="#main-content">Skip to report content</a>').Append($sidebar)
+    [void]$docSb.Append('<main id="main-content" class="main">').Append($cover).Append($banners.ToString()).Append($cardsSb.ToString()).Append($searchBar).Append($sectionsSb.ToString()).Append($footer)
     [void]$docSb.Append('</main><script>' + $script:ReportJs + '</script></body></html>')
 
-    # ---- Write HTML ----------------------------------------------------------
     $outDir = [System.IO.Path]::GetDirectoryName($resolvedOutput)
-    if (-not [string]::IsNullOrWhiteSpace($outDir) -and -not (Test-Path -LiteralPath $outDir)) {
-        [void](New-Item -ItemType Directory -Path $outDir -Force)
-    }
+    if (-not [string]::IsNullOrWhiteSpace($outDir) -and -not (Test-Path -LiteralPath $outDir)) { [void](New-Item -ItemType Directory -Path $outDir -Force) }
     $utf8 = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($resolvedOutput, $docSb.ToString(), $utf8)
 
-    # ---- Build structured summary (for -JsonPath / -PassThru) ----------------
-    $findingsSummary = @(foreach ($f in $script:Findings) {
-        [pscustomobject]@{
-            severity = $f.Sev
-            label    = $f.Label
-            location = if ($script:IsRedacted) { Apply-Redaction $f.Where } else { $f.Where }
-            detail   = if ($script:IsRedacted) { Apply-Redaction $f.Detail } else { $f.Detail }
-        }
-    })
     $summaryObj = [pscustomobject]@{
         toolVersion   = $script:ToolVersion
         generatedAt   = $genTime
@@ -3384,36 +2515,27 @@ function Invoke-PfSenseReport {
         configVersion = $version
         outputPath    = $resolvedOutput
         counts        = [pscustomobject]@{
-            interfaces   = $cIf
-            vlans        = $cVlan
-            virtualIps   = $cVip
-            gateways     = $cGw
-            staticRoutes = $cRoute
-            firewallRules = $cFw
-            portForwards = $cPf
-            ipsecTunnels = $cP1
-            openVpn      = $cOv
-            wireGuard    = $cWg
-            certsAndCas  = $cCert
-            users        = $cUser
-            aliases      = $cAlias
-            packages     = $cPkg
-            findings     = [pscustomobject]@{
-                total = $cFind
-                high  = $highCount
-                warn  = $warnCount
-                info  = $infoCount
-            }
+            interfaces    = $counts.interfaces;    vlans         = $counts.vlans;        virtualIps   = $counts.virtualIps
+            gateways      = $counts.gateways;      staticRoutes  = $counts.staticRoutes; firewallRules = $counts.firewallRules
+            portForwards  = $counts.portForwards;  ipsecTunnels  = $counts.ipsecTunnels; openVpn      = $counts.openVpn
+            wireGuard     = $counts.wireGuard;     certsAndCas   = $counts.certsAndCas;  users        = $counts.users
+            aliases       = $counts.aliases;       packages      = $counts.packages
+            findings      = [pscustomobject]@{ total = $cFind; high = $highCount; warn = $warnCount; info = $infoCount }
         }
-        findings      = $findingsSummary
+        findings      = @(foreach ($f in $script:Findings) {
+            [pscustomobject]@{
+                severity = $f.Sev
+                label    = $f.Label
+                location = if ($script:IsRedacted) { Apply-Redaction $f.Where } else { $f.Where }
+                detail   = if ($script:IsRedacted) { Apply-Redaction $f.Detail } else { $f.Detail }
+            }
+        })
     }
 
     if (-not [string]::IsNullOrWhiteSpace($JsonPathValue)) {
         $resolvedJson = Resolve-FullPath $JsonPathValue
         $jsonDir = [System.IO.Path]::GetDirectoryName($resolvedJson)
-        if (-not [string]::IsNullOrWhiteSpace($jsonDir) -and -not (Test-Path -LiteralPath $jsonDir)) {
-            [void](New-Item -ItemType Directory -Path $jsonDir -Force)
-        }
+        if (-not [string]::IsNullOrWhiteSpace($jsonDir) -and -not (Test-Path -LiteralPath $jsonDir)) { [void](New-Item -ItemType Directory -Path $jsonDir -Force) }
         [System.IO.File]::WriteAllText($resolvedJson, ($summaryObj | ConvertTo-Json -Depth 6), $utf8)
     }
 
@@ -3421,24 +2543,16 @@ function Invoke-PfSenseReport {
         Write-Host "pfSense report written to: $resolvedOutput" -ForegroundColor Green
         Write-Host ("{0} sections rendered, {1} risk flag(s) raised ({2} high, {3} warn, {4} info)." -f $sectionDefs.Count, $cFind, $highCount, $warnCount, $infoCount)
     }
-
     return $summaryObj
 }
 
-# Execute only when run directly (not when dot-sourced for unit tests)
 if ($MyInvocation.InvocationName -ne '.') {
     try {
         $result = Invoke-PfSenseReport `
-            -ConfigPathValue $ConfigPath `
-            -OutputPathValue $OutputPath `
-            -RedactValue ([bool]$Redact) `
-            -TitleValue $Title `
-            -LogoPathValue $LogoPath `
-            -WanInterfacesValue $WanInterfaces `
-            -InternalInterfacesValue $InternalInterfaces `
-            -ExpiryWarnDaysValue $ExpiryWarnDays `
-            -JsonPathValue $JsonPath `
-            -QuietValue ([bool]$Quiet)
+            -ConfigPathValue $ConfigPath -OutputPathValue $OutputPath -RedactValue ([bool]$Redact) `
+            -TitleValue $Title -LogoPathValue $LogoPath `
+            -WanInterfacesValue $WanInterfaces -InternalInterfacesValue $InternalInterfaces `
+            -ExpiryWarnDaysValue $ExpiryWarnDays -JsonPathValue $JsonPath -QuietValue ([bool]$Quiet)
         if ($PassThru) { $result }
         exit 0
     }

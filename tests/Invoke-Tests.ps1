@@ -25,34 +25,39 @@ $ErrorActionPreference = 'Stop'
 $script:Failures = 0
 $script:Passed   = 0
 
-# Resolve defaults in the body (PS 5.1 compatibility) with cross-platform Join-Path
-if (-not $ScriptPath) {
-    $repoRoot   = Split-Path -Path $PSScriptRoot -Parent
-    $ScriptPath = Join-Path $repoRoot 'pfsense_report.ps1'
-}
-if (-not $Fixture) {
-    $fixDir  = Join-Path $PSScriptRoot 'fixtures'
-    $Fixture = Join-Path $fixDir 'sample-config.xml'
-}
+if (-not $ScriptPath) { $ScriptPath = Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'pfsense_report.ps1' }
+if (-not $Fixture)    { $Fixture    = Join-Path (Join-Path $PSScriptRoot 'fixtures') 'sample-config.xml' }
 
 function Check {
     param([string]$Name, [bool]$Condition)
-    if ($Condition) {
-        Write-Host ("  PASS  " + $Name) -ForegroundColor Green
-        $script:Passed++
-    }
-    else {
-        Write-Host ("  FAIL  " + $Name) -ForegroundColor Red
-        $script:Failures++
-    }
+    if ($Condition) { Write-Host ("  PASS  " + $Name) -ForegroundColor Green; $script:Passed++ }
+    else            { Write-Host ("  FAIL  " + $Name) -ForegroundColor Red;   $script:Failures++ }
 }
 
-$exe = if ($PSVersionTable.PSVersion.Major -ge 6) { 'pwsh' } else { 'powershell' }
+$exe        = if ($PSVersionTable.PSVersion.Major -ge 6) { 'pwsh' } else { 'powershell' }
 $ScriptPath = (Resolve-Path -LiteralPath $ScriptPath).Path
 $Fixture    = (Resolve-Path -LiteralPath $Fixture).Path
 $tmpRoot    = Join-Path ([System.IO.Path]::GetTempPath()) ('pf2html-tests-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
 [void](New-Item -ItemType Directory -Path $tmpRoot -Force)
 $utf8NoBom  = New-Object System.Text.UTF8Encoding($false)
+
+function Invoke-ReportCli {
+    param([string[]]$CliArgs, [switch]$SuppressStderr)
+    $prevEAP = $ErrorActionPreference
+    if ($SuppressStderr) { $ErrorActionPreference = 'Continue' }
+    try {
+        if ($SuppressStderr) {
+            & $exe -NoProfile -ExecutionPolicy Bypass -File $ScriptPath @CliArgs 2>$null | Out-Null
+        }
+        else {
+            & $exe -NoProfile -ExecutionPolicy Bypass -File $ScriptPath @CliArgs | Out-Null
+        }
+        return $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $prevEAP
+    }
+}
 
 Write-Host ("Testing {0} with {1} ({2})" -f (Split-Path $ScriptPath -Leaf), $exe, $PSVersionTable.PSVersion)
 
@@ -66,12 +71,9 @@ try {
     Check "script parses with no syntax errors" (-not $perr)
 
     $rawBytes = [System.IO.File]::ReadAllBytes($ScriptPath)
-    $hasBom   = ($rawBytes.Length -ge 3 -and $rawBytes[0] -eq 0xEF -and $rawBytes[1] -eq 0xBB -and $rawBytes[2] -eq 0xBF)
-    Check "pfsense_report.ps1 has UTF-8 BOM (PS 5.1 compatibility)" $hasBom
+    Check "pfsense_report.ps1 has UTF-8 BOM (PS 5.1 compatibility)" ($rawBytes.Length -ge 3 -and $rawBytes[0] -eq 0xEF -and $rawBytes[1] -eq 0xBB -and $rawBytes[2] -eq 0xBF)
     $nonAscii = $false
-    for ($i = 3; $i -lt $rawBytes.Length; $i++) {
-        if ($rawBytes[$i] -gt 127) { $nonAscii = $true; break }
-    }
+    for ($i = 3; $i -lt $rawBytes.Length; $i++) { if ($rawBytes[$i] -gt 127) { $nonAscii = $true; break } }
     Check "pfsense_report.ps1 body is pure ASCII" (-not $nonAscii)
 
     # ==============================================================================
@@ -83,52 +85,42 @@ try {
     $script:RedactHost   = 'fw'
     $script:RedactDomain = 'example.com'
 
-    Check "Get-Ipv4Mask /0 -> 0.0.0.0"   ((Get-Ipv4Mask '0') -eq '0.0.0.0')
-    Check "Get-Ipv4Mask /24 -> 255.255.255.0" ((Get-Ipv4Mask '24') -eq '255.255.255.0')
+    Check "Get-Ipv4Mask /0 -> 0.0.0.0"         ((Get-Ipv4Mask '0') -eq '0.0.0.0')
+    Check "Get-Ipv4Mask /24 -> 255.255.255.0"  ((Get-Ipv4Mask '24') -eq '255.255.255.0')
     Check "Get-Ipv4Mask /32 -> 255.255.255.255" ((Get-Ipv4Mask '32') -eq '255.255.255.255')
-    Check "Get-Ipv4Mask invalid -> empty" ((Get-Ipv4Mask '99') -eq '')
+    Check "Get-Ipv4Mask invalid -> empty"      ((Get-Ipv4Mask '99') -eq '')
 
-    # Redaction: MAC normalization
-    $m1 = Apply-Redaction '00:11:22:33:44:55'
-    $m2 = Apply-Redaction '00-11-22-33-44-55'
+    $m1 = Apply-Redaction '00:11:22:33:44:55'; $m2 = Apply-Redaction '00-11-22-33-44-55'
     Check "redaction: colon and hyphen MAC normalize to same MAC-NNN" ($m1 -match '^MAC-\d{3}$' -and $m1 -eq $m2)
 
-    # Redaction: IPv4 validation & OID protection
     $ip4 = Apply-Redaction 'Server 192.0.2.10/24 oid 1.3.6.1.4.1 invalid 999.0.0.1'
     Check "redaction: valid IPv4 masked with CIDR preserved" ($ip4 -match 'IP-\d{3}/24' -and $ip4 -notmatch '192\.0\.2\.10')
-    Check "redaction: OID and invalid octets not corrupted" ($ip4 -match '1\.3\.6\.1\.4\.1' -and $ip4 -match '999\.0\.0\.1')
+    Check "redaction: OID and invalid octets not corrupted"  ($ip4 -match '1\.3\.6\.1\.4\.1' -and $ip4 -match '999\.0\.0\.1')
 
-    # Redaction: IPv6 compressed + full + timestamp protection
-    $v6a = Apply-Redaction 'fe80::1'
-    $v6b = Apply-Redaction '2001:0db8::1'
-    $v6c = Apply-Redaction '2001:db8::1'
+    $v6a = Apply-Redaction 'fe80::1'; $v6b = Apply-Redaction '2001:0db8::1'; $v6c = Apply-Redaction '2001:db8::1'
     $ts  = Apply-Redaction '2023-11-14 22:13:20 -07:00'
-    Check "redaction: compressed IPv6 (fe80::1) masked" ($v6a -match '^IP-\d{3}$')
-    Check "redaction: IPv6 canonical forms map to same token" ($v6b -match '^IP-\d{3}$' -and $v6b -eq $v6c)
-    Check "redaction: HH:MM:SS timestamps NOT corrupted to IP-NNN" ($ts -eq '2023-11-14 22:13:20 -07:00')
+    Check "redaction: compressed IPv6 (fe80::1) masked"                ($v6a -match '^IP-\d{3}$')
+    Check "redaction: IPv6 canonical forms map to same token"          ($v6b -match '^IP-\d{3}$' -and $v6b -eq $v6c)
+    Check "redaction: HH:MM:SS timestamps NOT corrupted to IP-NNN"     ($ts -eq '2023-11-14 22:13:20 -07:00')
 
-    # Redaction: Short hostname word boundaries & FQDN correlation (no double-redaction)
     $prose = Apply-Redaction 'software on fw and fw.example.com and fw01 using pfsense_report.ps1'
     Check "redaction: short hostname 'fw' does not mangle 'software' or 'fw01'" ($prose -match '\bsoftware\b' -and $prose -match '\bfw01\b')
-    Check "redaction: filename pfsense_report.ps1 not treated as FQDN" ($prose -match 'pfsense_report\.ps1')
+    Check "redaction: filename pfsense_report.ps1 not treated as FQDN"          ($prose -match 'pfsense_report\.ps1')
     Check "redaction: bare 'fw' and 'fw.example.com' share consistent HOST/DOMAIN tokens" ($prose -match 'on (HOST-\d{3}) and \1\.(DOMAIN-\d{3})')
 
-    # Redaction: Email & Cert DN
     $em = Apply-Redaction 'Contact alice@example.com'
     Check "redaction: email masks local-part and domain" ($em -notmatch 'alice' -and $em -match 'USER-\d{3}@DOMAIN-\d{3}')
     $dn = E-CertDn 'CN=fw.example.com, O=Acme Corp, OU=Security, L=Seattle, ST=WA, C=US'
     Check "redaction: cert DN masks O/OU/L/ST and CN" ($dn -notmatch 'Acme' -and $dn -notmatch 'Seattle' -and $dn -match 'O=ORG-\d{3}')
 
-    # Weak crypto & DH
     $wk1 = Get-WeakCryptoHits @('3des', 'hmac_sha1', 'md5')
     Check "weak crypto: 3DES/MD5 in High, SHA-1 in Warn" (($wk1.High -contains '3DES') -and ($wk1.High -contains 'MD5') -and ($wk1.Warn -contains 'SHA-1'))
     $wk2 = Get-WeakCryptoHits @('aes-256-gcm', 'sha256')
     Check "weak crypto: AES-256-GCM / SHA256 clean" ($wk2.High.Count -eq 0 -and $wk2.Warn.Count -eq 0)
-    Check "weak DH: group 2 -> high" ((Get-WeakDhFinding '2' $false).Sev -eq 'high')
-    Check "weak DH: PFS 0 -> warn NO PFS" ((Get-WeakDhFinding '0' $true).Label -eq 'NO PFS')
-    Check "weak DH: group 14 -> clean" ($null -eq (Get-WeakDhFinding '14' $false))
+    Check "weak DH: group 2 -> high"       ((Get-WeakDhFinding '2' $false).Sev -eq 'high')
+    Check "weak DH: PFS 0 -> warn NO PFS"  ((Get-WeakDhFinding '0' $true).Label -eq 'NO PFS')
+    Check "weak DH: group 14 -> clean"     ($null -eq (Get-WeakDhFinding '14' $false))
 
-    # Exposure model
     $expMgmt = Get-RuleExposure -trust 'wan' -type 'pass' -dir 'in' -protoClass 'tcpudp' -srcBroad $true -dstBroad $false -dstPortSet $true -protoDisp 'tcp' -dstSvc 'wanip:443' -isFirewallMgmt $true
     Check "exposure: WAN management access flagged HIGH (WAN MGMT EXPOSED)" ($null -ne $expMgmt -and $expMgmt.Sev -eq 'high' -and $expMgmt.Label -eq 'WAN MGMT EXPOSED')
     $expFloat = Get-RuleExposure -trust 'floating' -type 'pass' -dir 'in' -protoClass 'tcpudp' -srcBroad $true -dstBroad $true -dstPortSet $false -protoDisp 'tcp' -dstSvc 'any' -floatingTouchesWan $true
@@ -142,8 +134,7 @@ try {
     $outRedact = Join-Path $tmpRoot 'pfreport-redacted.html'
     $outJson   = Join-Path $tmpRoot 'pfreport-redacted.json'
 
-    & $exe -NoProfile -ExecutionPolicy Bypass -File $ScriptPath -ConfigPath $Fixture -OutputPath $outNormal -Quiet | Out-Null
-    Check "normal run exits 0" ($LASTEXITCODE -eq 0)
+    Check "normal run exits 0" ((Invoke-ReportCli @('-ConfigPath', $Fixture, '-OutputPath', $outNormal, '-Quiet')) -eq 0)
     Check "output HTML created" (Test-Path -LiteralPath $outNormal)
 
     $h = if (Test-Path -LiteralPath $outNormal) { [System.IO.File]::ReadAllText($outNormal) } else { '' }
@@ -162,16 +153,12 @@ try {
     Check "port forward rendered" ($h -match 'HTTPS to web server')
     Check "1:1 NAT rendered" ($h -match '1:1 mapping')
     Check "Confidentiality Notice banner shown when secrets present" ($h -match 'Confidentiality Notice')
-
-    # Secret-leakage checks
     Check "no PEM PRIVATE KEY block leaked" (-not ($h -cmatch 'BEGIN [A-Z ]*PRIVATE KEY'))
     Check "no bcrypt hash leaked" (-not ($h -match '\$2y\$'))
     Check "no private-key placeholder leaked" (-not ($h -match 'NOT-A-REAL-PRIVATE-KEY'))
     Check "PSK shown (behind click-to-reveal) when NOT redacted" ($h -match 'secret-val is-masked[^>]*>EXAMPLEPSKdonotuse<')
 
-    # Redacted + JSON run
-    & $exe -NoProfile -ExecutionPolicy Bypass -File $ScriptPath -ConfigPath $Fixture -OutputPath $outRedact -JsonPath $outJson -Redact -Quiet | Out-Null
-    Check "redacted + JSON run exits 0" ($LASTEXITCODE -eq 0)
+    Check "redacted + JSON run exits 0" ((Invoke-ReportCli @('-ConfigPath', $Fixture, '-OutputPath', $outRedact, '-JsonPath', $outJson, '-Redact', '-Quiet')) -eq 0)
     $r = if (Test-Path -LiteralPath $outRedact) { [System.IO.File]::ReadAllText($outRedact) } else { '' }
     Check "redacted: PSK removed" (-not ($r -match 'EXAMPLEPSKdonotuse'))
     Check "redacted: Confidentiality Notice omitted" (-not ($r -match 'Confidentiality Notice'))
@@ -185,7 +172,7 @@ try {
     Check "JSON export file created" (Test-Path -LiteralPath $outJson)
     $jText = if (Test-Path -LiteralPath $outJson) { [System.IO.File]::ReadAllText($outJson) } else { '{}' }
     $jObj  = $jText | ConvertFrom-Json
-    Check "JSON counts.interfaces == 3" ($jObj.counts.interfaces -eq 3)
+    Check "JSON counts.interfaces == 3"    ($jObj.counts.interfaces -eq 3)
     Check "JSON counts.firewallRules == 3" ($jObj.counts.firewallRules -eq 3)
     Check "JSON redacted flag true and no raw IP/PSK" ($jObj.redacted -eq $true -and $jText -notmatch '192\.0\.2\.' -and $jText -notmatch 'EXAMPLEPSKdonotuse')
 
@@ -263,8 +250,7 @@ try {
     $advOut  = Join-Path $tmpRoot 'advanced-report.html'
     [System.IO.File]::WriteAllText($advPath, $advXml, $utf8NoBom)
 
-    & $exe -NoProfile -ExecutionPolicy Bypass -File $ScriptPath -ConfigPath $advPath -OutputPath $advOut -Title '<script>alert(1)</script>' -Quiet | Out-Null
-    Check "advanced config (including quote in refid) exits 0" ($LASTEXITCODE -eq 0)
+    Check "advanced config (including quote in refid) exits 0" ((Invoke-ReportCli @('-ConfigPath', $advPath, '-OutputPath', $advOut, '-Title', '<script>alert(1)</script>', '-Quiet')) -eq 0)
     $ah = if (Test-Path -LiteralPath $advOut) { [System.IO.File]::ReadAllText($advOut) } else { '' }
 
     Check "XSS in -Title is HTML-encoded" (-not ($ah -match '<script>alert\(1\)</script>') -and $ah -match '&lt;script&gt;alert\(1\)&lt;/script&gt;')
@@ -289,57 +275,39 @@ try {
     Check "urltable alias URL rendered" ($ah -match 'https://lists\.example/block\.txt')
     Check "track6 interface rendered without stale /64" ($ah -match 'Track IPv6 \(WAN, prefix 0\)' -and -not ($ah -match 'Track IPv6 \(WAN, prefix 0\)/64'))
     Check "zero secret leakage (WireGuard keys, HA pass, LDAP bindpw, DynDNS token)" (
-        -not ($ah -match 'WG_SUPER_SECRET_PRIVATE_KEY') -and
-        -not ($ah -match 'WG_SUPER_SECRET_PSK') -and
-        -not ($ah -match 'SUPERSECRETHAPASS') -and
-        -not ($ah -match 'SUPERSECRETLDAPBINDPW') -and
-        -not ($ah -match 'SUPERSECRETDYNTOKEN')
+        -not ($ah -match 'WG_SUPER_SECRET_PRIVATE_KEY') -and -not ($ah -match 'WG_SUPER_SECRET_PSK') -and
+        -not ($ah -match 'SUPERSECRETHAPASS') -and -not ($ah -match 'SUPERSECRETLDAPBINDPW') -and -not ($ah -match 'SUPERSECRETDYNTOKEN')
     )
 
-    # Minimal empty <pfsense/> config
-    $minPath = Join-Path $tmpRoot 'minimal.xml'
-    $minOut  = Join-Path $tmpRoot 'minimal-report.html'
+    $minPath = Join-Path $tmpRoot 'minimal.xml'; $minOut = Join-Path $tmpRoot 'minimal-report.html'
     [System.IO.File]::WriteAllText($minPath, '<?xml version="1.0"?><pfsense></pfsense>', $utf8NoBom)
-    & $exe -NoProfile -ExecutionPolicy Bypass -File $ScriptPath -ConfigPath $minPath -OutputPath $minOut -Quiet | Out-Null
+    $minExit = Invoke-ReportCli @('-ConfigPath', $minPath, '-OutputPath', $minOut, '-Quiet')
     $mh = if (Test-Path -LiteralPath $minOut) { [System.IO.File]::ReadAllText($minOut) } else { '' }
-    Check "minimal <pfsense/> exits 0 with version warning" ($LASTEXITCODE -eq 0 -and $mh -match 'No pfSense configuration version')
+    Check "minimal <pfsense/> exits 0 with version warning" ($minExit -eq 0 -and $mh -match 'No pfSense configuration version')
 
-    # Relative OutputPath after Set-Location (regression for .NET CWD bug)
     $relDir = Join-Path $tmpRoot 'rel-cwd-test'
     [void](New-Item -ItemType Directory -Path $relDir -Force)
-    $relCmd = "Set-Location -LiteralPath '$relDir'; & '$ScriptPath' -ConfigPath '$Fixture' -OutputPath 'relative-out.html' -Quiet"
-    & $exe -NoProfile -ExecutionPolicy Bypass -Command $relCmd | Out-Null
+    & $exe -NoProfile -ExecutionPolicy Bypass -Command "Set-Location -LiteralPath '$relDir'; & '$ScriptPath' -ConfigPath '$Fixture' -OutputPath 'relative-out.html' -Quiet" | Out-Null
     Check "relative -OutputPath respects PowerShell Set-Location CWD" (Test-Path -LiteralPath (Join-Path $relDir 'relative-out.html'))
 
     # ==============================================================================
     # 5. Negative error handling (missing file, directory, XXE, invalid XML, wrong root)
     # ==============================================================================
     Write-Host "`n[5/5] Error handling & XXE rejection" -ForegroundColor Cyan
-    $prevEAP = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-
-    & $exe -NoProfile -ExecutionPolicy Bypass -File $ScriptPath -ConfigPath (Join-Path $tmpRoot 'does-not-exist.xml') -OutputPath $outNormal 2>$null | Out-Null
-    Check "missing config file exits 1" ($LASTEXITCODE -eq 1)
-
-    & $exe -NoProfile -ExecutionPolicy Bypass -File $ScriptPath -ConfigPath $tmpRoot -OutputPath $outNormal 2>$null | Out-Null
-    Check "directory passed as -ConfigPath exits 1" ($LASTEXITCODE -eq 1)
+    Check "missing config file exits 1"             ((Invoke-ReportCli @('-ConfigPath', (Join-Path $tmpRoot 'does-not-exist.xml'), '-OutputPath', $outNormal) -SuppressStderr) -eq 1)
+    Check "directory passed as -ConfigPath exits 1" ((Invoke-ReportCli @('-ConfigPath', $tmpRoot, '-OutputPath', $outNormal) -SuppressStderr) -eq 1)
 
     $xxePath = Join-Path $tmpRoot 'xxe.xml'
     [System.IO.File]::WriteAllText($xxePath, '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe "pwn">]><pfsense><version>22.5</version><system><hostname>&xxe;</hostname></system></pfsense>', $utf8NoBom)
-    & $exe -NoProfile -ExecutionPolicy Bypass -File $ScriptPath -ConfigPath $xxePath -OutputPath $outNormal 2>$null | Out-Null
-    Check "XXE / DTD payload rejected with exit 1" ($LASTEXITCODE -eq 1)
+    Check "XXE / DTD payload rejected with exit 1"  ((Invoke-ReportCli @('-ConfigPath', $xxePath, '-OutputPath', $outNormal) -SuppressStderr) -eq 1)
 
     $badXmlPath = Join-Path $tmpRoot 'bad.xml'
     [System.IO.File]::WriteAllText($badXmlPath, '<pfsense><unclosed>', $utf8NoBom)
-    & $exe -NoProfile -ExecutionPolicy Bypass -File $ScriptPath -ConfigPath $badXmlPath -OutputPath $outNormal 2>$null | Out-Null
-    Check "malformed XML exits 1" ($LASTEXITCODE -eq 1)
+    Check "malformed XML exits 1"                   ((Invoke-ReportCli @('-ConfigPath', $badXmlPath, '-OutputPath', $outNormal) -SuppressStderr) -eq 1)
 
     $wrongRootPath = Join-Path $tmpRoot 'wrong-root.xml'
     [System.IO.File]::WriteAllText($wrongRootPath, '<?xml version="1.0"?><notpfsense/>', $utf8NoBom)
-    & $exe -NoProfile -ExecutionPolicy Bypass -File $ScriptPath -ConfigPath $wrongRootPath -OutputPath $outNormal 2>$null | Out-Null
-    Check "non-pfSense XML root exits 1" ($LASTEXITCODE -eq 1)
-
-    $ErrorActionPreference = $prevEAP
+    Check "non-pfSense XML root exits 1"            ((Invoke-ReportCli @('-ConfigPath', $wrongRootPath, '-OutputPath', $outNormal) -SuppressStderr) -eq 1)
 }
 finally {
     Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
