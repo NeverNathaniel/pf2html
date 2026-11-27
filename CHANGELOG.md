@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- Compact **Hudu / KB export mode** (`-Hudu`, `-HuduFormat Html|Markdown`): produces a clean, paste-ready inline-styled HTML fragment or GFM Markdown summary with only the essential setup details (empty sections omitted, disabled firewall rules omitted with a count note, IPsec Phase 1+2 combined, high/warn alerts highlighted, and all PSKs/secrets omitted for password-vault storage). Auto-selects Markdown when `-OutputPath` ends in `.md` or `.markdown`.
 
 ## [1.1.0] - 2026-11-26
 ### Security

@@ -94,14 +94,22 @@ Download `pfsense_report.ps1` (with SHA-256 checksums) from the
 | `-InternalInterfaces` | Optional interface keys (e.g. `'opt1'`) to force as trusted / internal. |
 | `-ExpiryWarnDays` | Days before certificate expiry to flag `EXPIRING SOON` (default `90`). |
 | `-JsonPath` | Optional path to export a structured JSON summary of metadata, counts, and findings (respects `-Redact`). |
+| `-Hudu` | Generate a simplified, paste-ready operational summary for **Hudu** (or any KB/wiki): essential setup tables only, empty sections omitted, no `<style>`/`<script>` boilerplate, and secrets omitted for vault storage. |
+| `-HuduFormat` | Format for `-Hudu`: `Html` (inline-styled embeddable HTML fragment, default) or `Markdown` (GFM Markdown; also auto-selected when `-OutputPath` ends in `.md`). |
 | `-PassThru` | Emit a summary object (`counts`, `findings`, `outputPath`, etc.) to the pipeline. |
 | `-Quiet` | Suppress status console output (warnings/errors still written). |
 
 ### Examples
 
 ```powershell
-# Internal report
+# Internal full report
 .\pfsense_report.ps1 -ConfigPath ".\config-fw01.xml" -OutputPath ".\fw01.html"
+
+# Simplified HTML fragment to paste into a Hudu KB article / asset field
+.\pfsense_report.ps1 -ConfigPath ".\config-fw01.xml" -Hudu -OutputPath ".\fw01-hudu.html"
+
+# Simplified Markdown summary (auto-detected from .md extension, or pass -HuduFormat Markdown)
+.\pfsense_report.ps1 -ConfigPath ".\config-fw01.xml" -Hudu -OutputPath ".\fw01-hudu.md"
 
 # Sanitized copy to share with a third party
 .\pfsense_report.ps1 -ConfigPath ".\config-fw01.xml" -OutputPath ".\fw01-shared.html" -Redact -Title "FW01 (Sanitized)"

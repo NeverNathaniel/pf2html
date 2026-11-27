@@ -47,6 +47,16 @@
     Optional path to also export a structured JSON summary of metadata, counts, and
     security findings (respects -Redact).
 
+.PARAMETER Hudu
+    Generate a simplified, paste-ready operational summary for Hudu (or other IT
+    documentation/KB platforms) containing only the essential setup details, with empty
+    sections omitted, no <style>/<script> boilerplate, and secrets omitted for vault storage.
+
+.PARAMETER HuduFormat
+    Output format when -Hudu is specified: 'Html' (inline-styled embeddable HTML fragment
+    for TinyMCE/Hudu Source Code or copy-paste, default) or 'Markdown' (GFM Markdown; also
+    auto-selected when -OutputPath ends in .md or .markdown).
+
 .PARAMETER PassThru
     Emit a summary object containing output path, counts, and findings to the pipeline.
 
@@ -60,7 +70,10 @@
     .\pfsense_report.ps1 -ConfigPath "config.xml" -OutputPath "shared.html" -Redact -Title "Acme Firewall"
 
 .EXAMPLE
-    .\pfsense_report.ps1 -ConfigPath "config.xml" -JsonPath "findings.json" -PassThru -Quiet
+    .\pfsense_report.ps1 -ConfigPath "config.xml" -Hudu -OutputPath "client-fw-hudu.html"
+
+.EXAMPLE
+    .\pfsense_report.ps1 -ConfigPath "config.xml" -Hudu -HuduFormat Markdown -OutputPath "client-fw.md"
 #>
 
 [CmdletBinding()]
@@ -85,6 +98,11 @@ param(
     [int]$ExpiryWarnDays = 90,
 
     [string]$JsonPath,
+
+    [switch]$Hudu,
+
+    [ValidateSet('Html', 'Markdown', 'Md')]
+    [string]$HuduFormat = 'Html',
 
     [switch]$PassThru,
 
@@ -2327,6 +2345,481 @@ $script:ReportJs = @'
 '@
 
 # ==================================================================================
+#  HUDU / COMPACT OPERATIONAL EXPORT (HTML FRAGMENT OR MARKDOWN)
+# ==================================================================================
+
+function Format-HuduCell {
+    param([object]$Value, [string]$Format, [ValidateSet('text', 'host', 'user', 'dn')][string]$Kind = 'text')
+    $raw = if ($null -eq $Value) { '' } else { ([string]$Value).Trim() }
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        if ($Format -eq 'Html') { return '<span style="color:#6c757d;">&mdash;</span>' }
+        return '-'
+    }
+    if ($script:IsRedacted) {
+        $raw = switch ($Kind) {
+            'host' { if ($raw.Contains('.') -or $raw.Contains(':')) { Apply-Redaction $raw } else { Get-RedactToken $raw.ToLowerInvariant() 'HOST' } }
+            'user' { if ($raw -match '@') { Apply-Redaction $raw } else { Get-RedactToken $raw.ToLowerInvariant() 'USER' } }
+            'dn'   {
+                $dn = [regex]::Replace($raw, '(?i)\b(O|OU|L|ST|S|STREET)=([^,]+)',
+                    [System.Text.RegularExpressions.MatchEvaluator] { param($m) $m.Groups[1].Value + '=' + (Get-RedactToken $m.Groups[2].Value.Trim() 'ORG') })
+                $dn = [regex]::Replace($dn, '(?i)\b(CN)=([^,]+)',
+                    [System.Text.RegularExpressions.MatchEvaluator] {
+                        param($m)
+                        $v = $m.Groups[2].Value.Trim(); $r = Apply-Redaction $v
+                        if ($r -eq $v -and -not (Test-IsRedactToken $v)) { $r = Get-RedactToken $v 'HOST' }
+                        return ($m.Groups[1].Value + '=' + $r)
+                    })
+                Apply-Redaction $dn
+            }
+            default { Apply-Redaction $raw }
+        }
+    }
+    if ($Format -eq 'Html') {
+        return [System.Net.WebUtility]::HtmlEncode($raw)
+    }
+    return (($raw -replace '\r?\n', ' ') -replace '\|', '\|')
+}
+
+function Add-HuduHeading {
+    param([System.Text.StringBuilder]$Sb, [string]$Text, [string]$Format, [int]$Level = 2)
+    if ($Format -eq 'Html') {
+        if ($Level -eq 2) {
+            [void]$Sb.Append('<h2 style="color:#1e3f75;border-bottom:2px solid #d0d7de;padding-bottom:4px;margin:20px 0 8px;font-size:16px;">').Append([System.Net.WebUtility]::HtmlEncode($Text)).Append("</h2>`n")
+        }
+        else {
+            [void]$Sb.Append('<h3 style="color:#2b5ea8;margin:14px 0 6px;font-size:14px;">').Append([System.Net.WebUtility]::HtmlEncode($Text)).Append("</h3>`n")
+        }
+    }
+    else {
+        $hashes = if ($Level -eq 2) { '##' } else { '###' }
+        [void]$Sb.Append("`n$hashes $Text`n`n")
+    }
+}
+
+function Add-HuduTable {
+    param([System.Text.StringBuilder]$Sb, [string[]]$Headers, [object[]]$Rows, [string]$Format)
+    if ($Rows.Count -eq 0) { return }
+    if ($Format -eq 'Html') {
+        [void]$Sb.Append('<table style="border-collapse:collapse;width:100%;margin:6px 0 14px;font-size:13px;border:1px solid #d0d7de;"><thead><tr>')
+        foreach ($h in $Headers) {
+            [void]$Sb.Append('<th style="background:#1e3f75;color:#ffffff;padding:6px 10px;text-align:left;border:1px solid #d0d7de;white-space:nowrap;">').Append([System.Net.WebUtility]::HtmlEncode($h)).Append('</th>')
+        }
+        [void]$Sb.Append('</tr></thead><tbody>')
+        $i = 0
+        foreach ($r in $Rows) {
+            $bg = if (($i % 2) -eq 1) { 'background:#f7f9fc;' } else { '' }
+            [void]$Sb.Append('<tr>')
+            foreach ($c in $r) {
+                [void]$Sb.Append('<td style="' + $bg + 'padding:6px 10px;border:1px solid #d0d7de;vertical-align:top;">').Append($c).Append('</td>')
+            }
+            [void]$Sb.Append('</tr>')
+            $i++
+        }
+        [void]$Sb.Append("</tbody></table>`n")
+    }
+    else {
+        [void]$Sb.Append('| ' + ($Headers -join ' | ') + " |`n")
+        [void]$Sb.Append('| ' + (($Headers | ForEach-Object { '---' }) -join ' | ') + " |`n")
+        foreach ($r in $Rows) {
+            [void]$Sb.Append('| ' + ($r -join ' | ') + " |`n")
+        }
+        [void]$Sb.Append("`n")
+    }
+}
+
+function Add-HuduKv {
+    param([System.Text.StringBuilder]$Sb, [object[]]$Pairs, [string]$Format)
+    if ($Pairs.Count -eq 0) { return }
+    if ($Format -eq 'Html') {
+        [void]$Sb.Append('<table style="border-collapse:collapse;width:100%;margin:6px 0 14px;font-size:13px;border:1px solid #d0d7de;"><tbody>')
+        foreach ($p in $Pairs) {
+            [void]$Sb.Append('<tr><th style="background:#eef2f8;color:#1f2933;padding:6px 10px;text-align:left;border:1px solid #d0d7de;width:210px;white-space:nowrap;">')
+            [void]$Sb.Append([System.Net.WebUtility]::HtmlEncode($p[0])).Append('</th><td style="padding:6px 10px;border:1px solid #d0d7de;">').Append($p[1]).Append('</td></tr>')
+        }
+        [void]$Sb.Append("</tbody></table>`n")
+    }
+    else {
+        Add-HuduTable $Sb @('Setting', 'Value') $Pairs 'Markdown'
+    }
+}
+
+function Build-HuduReport {
+    param($Root, [string]$Format, [string]$TitleValue, [string]$Fqdn, [string]$Version, [string]$GenTime)
+    $sb = New-Object System.Text.StringBuilder
+    $c  = { param($v, $k = 'text') Format-HuduCell $v $Format $k }
+
+    # Header & Metadata
+    $rev = $Root.SelectSingleNode('revision')
+    $lastChg = if ($null -ne $rev) { ConvertFrom-Epoch (XText $rev 'time') } else { ConvertFrom-Epoch (XText $Root 'lastchange') }
+    $titleStr = if ($script:IsRedacted) { (Apply-Redaction $TitleValue) + ' (Redacted)' } else { $TitleValue }
+    $verDisp  = if ($Version) { $Version } else { 'unknown' }
+
+    if ($Format -eq 'Html') {
+        [void]$sb.Append('<div style="font-family:-apple-system,BlinkMacSystemFont,''Segoe UI'',Roboto,Helvetica,Arial,sans-serif;color:#1f2933;line-height:1.45;">' + "`n")
+        [void]$sb.Append('<h1 style="color:#1e3f75;margin:0 0 6px;font-size:21px;">' + [System.Net.WebUtility]::HtmlEncode($titleStr) + "</h1>`n")
+        $meta = '<strong>Host:</strong> ' + [System.Net.WebUtility]::HtmlEncode($Fqdn) +
+                ' &nbsp;|&nbsp; <strong>pfSense Config:</strong> ' + [System.Net.WebUtility]::HtmlEncode($verDisp) +
+                ' &nbsp;|&nbsp; <strong>Generated:</strong> ' + [System.Net.WebUtility]::HtmlEncode($GenTime)
+        if ($lastChg) { $meta += ' &nbsp;|&nbsp; <strong>Last Change:</strong> ' + [System.Net.WebUtility]::HtmlEncode($lastChg) }
+        [void]$sb.Append('<p style="color:#5a6573;font-size:12px;margin:0 0 14px;">' + $meta + "</p>`n")
+    }
+    else {
+        [void]$sb.Append("# $titleStr`n`n")
+        $meta = "**Host:** ``$Fqdn`` | **pfSense Config:** ``$verDisp`` | **Generated:** $GenTime"
+        if ($lastChg) { $meta += " | **Last Change:** $lastChg" }
+        [void]$sb.Append("$meta`n`n")
+    }
+
+    # Key Security Alerts (HIGH and WARN only - skip info/NO LOG noise)
+    $alerts = @($script:Findings | Where-Object { $_.Sev -in @('high', 'warn') } | Sort-Object @{ Expression = { if ($_.Sev -eq 'high') { 0 } else { 1 } } }, Label, Where)
+    if ($alerts.Count -gt 0) {
+        if ($Format -eq 'Html') {
+            [void]$sb.Append('<div style="background:#fef6e7;border:1px solid #f0d9a8;border-left:4px solid #c0392b;padding:10px 14px;border-radius:4px;margin:0 0 16px;">')
+            [void]$sb.Append('<strong style="color:#c0392b;">Key Security Alerts (' + $alerts.Count + '):</strong><ul style="margin:6px 0 0;padding-left:18px;font-size:13px;">')
+            foreach ($a in $alerts) {
+                $clr = if ($a.Sev -eq 'high') { '#c0392b' } else { '#9a5d05' }
+                [void]$sb.Append('<li><strong style="color:' + $clr + ';">[' + (& $c $a.Label) + ']</strong> ' + (& $c $a.Where) + ' &mdash; ' + (& $c $a.Detail) + '</li>')
+            }
+            [void]$sb.Append("</ul></div>`n")
+        }
+        else {
+            [void]$sb.Append("> **Key Security Alerts ($($alerts.Count)):**`n")
+            foreach ($a in $alerts) {
+                [void]$sb.Append("> - **[$(& $c $a.Label)]** $(& $c $a.Where) - $(& $c $a.Detail)`n")
+            }
+            [void]$sb.Append("`n")
+        }
+    }
+
+    # 1. System Overview
+    $sys = $Root.SelectSingleNode('system')
+    if ($null -ne $sys) {
+        Add-HuduHeading $sb 'System Overview' $Format
+        $gui = $sys.SelectSingleNode('webgui')
+        $gProto = XText $gui 'protocol'; if (-not $gProto) { $gProto = 'https' }
+        $gPort  = XText $gui 'port';     if (-not $gPort)  { $gPort = if ($gProto -eq 'http') { '80' } else { '443' } }
+        $sshNode = $sys.SelectSingleNode('ssh')
+        $sshEn = Test-XmlEnabled $sshNode @('enable', 'enabled')
+        $sshDisp = if ($sshEn) { 'Enabled (port ' + $(if (XText $sshNode 'port') { XText $sshNode 'port' } else { '22' }) + ')' } else { 'Disabled' }
+        $dnsList = @((XNodes $sys 'dnsserver') | ForEach-Object { $_.InnerText.Trim() } | Where-Object { $_ })
+        $ntpList = @((XText $sys 'timeservers') -split '\s+' | Where-Object { $_ })
+        $sysPairs = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($p in @(
+            @('Hostname / Domain', ((& $c (XText $sys 'hostname') 'host') + ' / ' + (& $c (XText $sys 'domain')))),
+            @('WebGUI',            (& $c "$gProto on port $gPort")),
+            @('SSH',               (& $c $sshDisp)),
+            @('DNS Servers',       (& $c ($dnsList -join ', '))),
+            @('NTP / Timezone',    ((& $c ($ntpList -join ', ')) + ' (' + (& $c (XText $sys 'timezone')) + ')'))
+        )) { [void]$sysPairs.Add($p) }
+        $dhcpBe = XText $Root 'dhcpbackend'
+        if ($dhcpBe) { [void]$sysPairs.Add(@('DHCP Backend', (& $c $dhcpBe.ToUpperInvariant()))) }
+        Add-HuduKv $sb $sysPairs.ToArray() $Format
+    }
+
+    # 2. Interfaces
+    $ifs = $Root.SelectSingleNode('interfaces')
+    if ($null -ne $ifs) {
+        $ifRows = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($n in $ifs.ChildNodes) {
+            if ($n.NodeType -ne [System.Xml.XmlNodeType]::Element) { continue }
+            $key = $n.Name; $dev = XText $n 'if'; $en = XHas $n 'enable'
+            $ip4 = XText $n 'ipaddr'; $sub = XText $n 'subnet'
+            $ip4Disp = if ($ip4 -match '^\d+\.' -and $sub) { "$ip4/$sub" } elseif ($ip4) { $ip4.ToUpperInvariant() } else { '' }
+            $v6 = XText $n 'ipaddrv6'
+            $v6Disp = if ($v6 -eq 'track6') { 'Track IPv6 (' + (XText $n 'track6-interface').ToUpperInvariant() + ')' } elseif ($v6 -and $v6 -ne 'none') { $v6 + $(if ((XText $n 'subnetv6') -and $v6 -notmatch '^(dhcp6|slaac)$') { '/' + (XText $n 'subnetv6') } else { '' }) } else { '' }
+            $vlan = if ($script:VlanMap.ContainsKey($dev)) { $script:VlanMap[$dev].Tag } elseif ($dev -match '\.(\d+)$') { $Matches[1] } else { '' }
+            [void]$ifRows.Add(@((& $c $key), (& $c (XText $n 'descr')), (& $c $dev), $(if ($en) { 'Yes' } else { 'No' }), (& $c $ip4Disp), (& $c $v6Disp), (& $c $vlan), (& $c (XText $n 'gateway'))))
+        }
+        if ($ifRows.Count -gt 0) {
+            Add-HuduHeading $sb 'Interfaces' $Format
+            Add-HuduTable $sb @('Key','Description','Device','Enabled','IPv4','IPv6','VLAN','Gateway') $ifRows.ToArray() $Format
+        }
+    }
+
+    # 3. VLANs, Virtual IPs & High Availability (only if configured)
+    $vlans = XNodes $Root 'vlans/vlan'
+    if ($vlans.Count -gt 0) {
+        Add-HuduHeading $sb 'VLANs' $Format
+        $rows = @(foreach ($v in $vlans) { ,@((& $c (XText $v 'if')), (& $c (XText $v 'tag')), (& $c (XText $v 'vlanif')), (& $c (XText $v 'descr'))) })
+        Add-HuduTable $sb @('Parent','Tag','Interface','Description') $rows $Format
+    }
+
+    $vips = XNodes $Root 'virtualip/vip'
+    if ($vips.Count -gt 0) {
+        Add-HuduHeading $sb 'Virtual IPs' $Format
+        $rows = @(foreach ($v in $vips) {
+            $sn = XText $v 'subnet'; $bits = XText $v 'subnet_bits'
+            ,@((& $c (XText $v 'mode').ToUpperInvariant()), (& $c (XText $v 'interface')), (& $c $(if ($sn -and $bits) { "$sn/$bits" } else { $sn })), (& $c (XText $v 'vhid')), (& $c (XText $v 'descr')))
+        })
+        Add-HuduTable $sb @('Type','Interface','Address','VHID','Description') $rows $Format
+    }
+
+    $ha = $Root.SelectSingleNode('hasync')
+    if ($null -ne $ha -and ((XHas $ha 'pfsyncenabled') -or (XText $ha 'synchronizetoip'))) {
+        Add-HuduHeading $sb 'High Availability (CARP / Sync)' $Format
+        Add-HuduKv $sb @(
+            @('pfsync',        $(if (XHas $ha 'pfsyncenabled') { 'Enabled' } else { 'Disabled' }) + ' on ' + (& $c (XText $ha 'pfsyncinterface')) + ' (peer ' + (& $c (XText $ha 'pfsyncpeerip')) + ')'),
+            @('XMLRPC Target', (& $c (XText $ha 'synchronizetoip')) + ' (user: ' + (& $c (XText $ha 'username') 'user') + ', password in vault)')
+        ) $Format
+    }
+
+    # 4. Gateways & Static Routes
+    $gws = XNodes $Root 'gateways/gateway_item'; $gwGroups = XNodes $Root 'gateways/gateway_group'; $routes = XNodes $Root 'staticroutes/route'
+    if ($gws.Count -gt 0 -or $gwGroups.Count -gt 0 -or $routes.Count -gt 0) {
+        Add-HuduHeading $sb 'Gateways & Routing' $Format
+        $gwNode = $Root.SelectSingleNode('gateways'); $d4 = XText $gwNode 'defaultgw4'; $d6 = XText $gwNode 'defaultgw6'
+        if ($gws.Count -gt 0) {
+            $rows = @(foreach ($g in $gws) {
+                $gn = XText $g 'name'; $isDef = if ($gn -and ($gn -eq $d4 -or $gn -eq $d6)) { 'DEFAULT' } else { '' }
+                ,@((& $c $gn), (& $c (XText $g 'interface')), (& $c (XText $g 'gateway')), (& $c (XText $g 'monitor')), (& $c $isDef), (& $c (XText $g 'descr')))
+            })
+            Add-HuduTable $sb @('Gateway','Interface','IP','Monitor','Default','Description') $rows $Format
+        }
+        if ($gwGroups.Count -gt 0) {
+            Add-HuduHeading $sb 'Gateway Groups' $Format 3
+            $rows = @(foreach ($gg in $gwGroups) {
+                $mem = @((XNodes $gg 'item') | ForEach-Object { $_.InnerText.Trim() -replace '\|', ' T' }) -join ', '
+                ,@((& $c (XText $gg 'name')), (& $c $mem), (& $c (XText $gg 'trigger')), (& $c (XText $gg 'descr')))
+            })
+            Add-HuduTable $sb @('Group','Members','Trigger','Description') $rows $Format
+        }
+        if ($routes.Count -gt 0) {
+            Add-HuduHeading $sb 'Static Routes' $Format 3
+            $rows = @(foreach ($r in $routes) {
+                ,@((& $c (XText $r 'network')), (& $c (XText $r 'gateway')), $(if (XHas $r 'disabled') { 'Disabled' } else { 'Enabled' }), (& $c (XText $r 'descr')))
+            })
+            Add-HuduTable $sb @('Destination','Gateway','Status','Description') $rows $Format
+        }
+    }
+
+    # 5. DHCP & DNS
+    $dhcpRows = New-Object 'System.Collections.Generic.List[object]'
+    $smapRows = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($spec in @(@{ Tag='dhcpd'; Label='v4' }, @{ Tag='dhcpdv6'; Label='v6' })) {
+        $dn = $Root.SelectSingleNode($spec.Tag); if ($null -eq $dn) { continue }
+        foreach ($in in $dn.ChildNodes) {
+            if ($in.NodeType -ne [System.Xml.XmlNodeType]::Element) { continue }
+            $ifName = if ($script:IfMap.ContainsKey($in.Name)) { "$($in.Name) ($($script:IfMap[$in.Name]))" } else { $in.Name }
+            $rng = (XText $in 'range/from') + ' - ' + (XText $in 'range/to')
+            if ($rng -eq ' - ') { $rng = '' }
+            $dns = @((XNodes $in 'dnsserver') | ForEach-Object { $_.InnerText.Trim() } | Where-Object { $_ }) -join ', '
+            [void]$dhcpRows.Add(@((& $c "$ifName [$($spec.Label)]"), $(if (XHas $in 'enable') { 'Yes' } else { 'No' }), (& $c $rng), (& $c (XText $in 'gateway')), (& $c $dns), (& $c (XText $in 'domain'))))
+            foreach ($m in (XNodes $in 'staticmap')) {
+                $idv = if ($spec.Tag -eq 'dhcpdv6') { XText $m 'duid' } else { XText $m 'mac' }
+                $ipv = if ($spec.Tag -eq 'dhcpdv6') { XText $m 'ipaddrv6' } else { XText $m 'ipaddr' }
+                [void]$smapRows.Add(@((& $c $in.Name), (& $c $ipv), (& $c $idv), (& $c (XText $m 'hostname') 'host'), (& $c (XText $m 'descr'))))
+            }
+        }
+    }
+    if ($dhcpRows.Count -gt 0) {
+        Add-HuduHeading $sb 'DHCP' $Format
+        Add-HuduTable $sb @('Interface','Enabled','Range','Gateway','DNS','Domain') $dhcpRows.ToArray() $Format
+        if ($smapRows.Count -gt 0) {
+            Add-HuduHeading $sb "DHCP Static Mappings ($($smapRows.Count))" $Format 3
+            Add-HuduTable $sb @('Interface','IP','MAC / DUID','Hostname','Description') $smapRows.ToArray() $Format
+        }
+    }
+
+    $unbound = $Root.SelectSingleNode('unbound'); $dnsmasq = $Root.SelectSingleNode('dnsmasq')
+    $dnsActive = if ($null -ne $unbound -and (XHas $unbound 'enable')) { $unbound } elseif ($null -ne $dnsmasq -and (XHas $dnsmasq 'enable')) { $dnsmasq } else { $null }
+    if ($null -ne $dnsActive) {
+        $dnsKind = if ($dnsActive.Name -eq 'unbound') { 'DNS Resolver (Unbound)' } else { 'DNS Forwarder (dnsmasq)' }
+        Add-HuduHeading $sb $dnsKind $Format
+        $listen = if ($dnsActive.Name -eq 'unbound') { XText $dnsActive 'active_interface' } else { XText $dnsActive 'interface' }
+        if (-not $listen) { $listen = 'All' }
+        $dnsPairs = @(@('Listening Interfaces', (& $c $listen)))
+        if ($dnsActive.Name -eq 'unbound') { $dnsPairs += ,@('Forwarding / DNSSEC', ($(if (XHas $dnsActive 'forwarding') { 'Forwarding' } else { 'Recursive' }) + ' / DNSSEC: ' + $(if (XHas $dnsActive 'dnssec') { 'On' } else { 'Off' }))) }
+        Add-HuduKv $sb $dnsPairs $Format
+        $hOvr = XNodes $dnsActive 'hosts'
+        if ($hOvr.Count -gt 0) {
+            Add-HuduHeading $sb 'DNS Host Overrides' $Format 3
+            $rows = @(foreach ($h in $hOvr) { ,@((& $c (XText $h 'host') 'host'), (& $c (XText $h 'domain')), (& $c (XText $h 'ip')), (& $c (XText $h 'descr'))) })
+            Add-HuduTable $sb @('Host','Domain','IP','Description') $rows $Format
+        }
+        $dOvr = XNodes $dnsActive 'domainoverrides'
+        if ($dOvr.Count -gt 0) {
+            Add-HuduHeading $sb 'DNS Domain Overrides' $Format 3
+            $rows = @(foreach ($d in $dOvr) { ,@((& $c (XText $d 'domain')), (& $c (XText $d 'ip')), (& $c (XText $d 'descr'))) })
+            Add-HuduTable $sb @('Domain','Forward-to IP','Description') $rows $Format
+        }
+    }
+
+    # 6. NAT & Port Forwards
+    $nat = $Root.SelectSingleNode('nat')
+    if ($null -ne $nat) {
+        $obMode = XText $nat 'outbound/mode'; if (-not $obMode) { $obMode = 'automatic' }
+        $pfNodes = XNodes $nat 'rule'; $otoNodes = XNodes $nat 'onetoone'; $obNodes = XNodes $nat 'outbound/rule'
+        if ($pfNodes.Count -gt 0 -or $otoNodes.Count -gt 0 -or $obNodes.Count -gt 0 -or $obMode -ne 'automatic') {
+            Add-HuduHeading $sb "NAT (Outbound Mode: $($obMode.ToUpperInvariant()))" $Format
+            if ($pfNodes.Count -gt 0) {
+                Add-HuduHeading $sb 'Port Forwards' $Format 3
+                $rows = @(foreach ($r in $pfNodes) {
+                    $src = Format-Endpoint $r.SelectSingleNode('source'); $dst = Format-Endpoint $r.SelectSingleNode('destination')
+                    $ep = if ($dst.Port) { $dst.Port } else { XText $r 'dstport' }
+                    $ext = $dst.Addr + $(if ($ep) { ":$ep" } else { '' })
+                    $tgt = (XText $r 'target') + $(if (XText $r 'local-port') { ':' + (XText $r 'local-port') } else { '' })
+                    $st  = if (XHas $r 'disabled') { 'Disabled' } elseif (XHas $r 'nordr') { 'NO RDR' } else { 'Active' }
+                    ,@((& $c (XText $r 'interface')), (& $c (XText $r 'protocol')), (& $c $src.Addr), (& $c $ext), (& $c $tgt), $st, (& $c (XText $r 'descr')))
+                })
+                Add-HuduTable $sb @('Interface','Proto','Source','External','Redirect Target','Status','Description') $rows $Format
+            }
+            if ($otoNodes.Count -gt 0) {
+                Add-HuduHeading $sb '1:1 NAT' $Format 3
+                $rows = @(foreach ($r in $otoNodes) {
+                    $src = Format-Endpoint $r.SelectSingleNode('source')
+                    $st  = if (XHas $r 'disabled') { 'Disabled' } elseif (XHas $r 'nobinat') { 'DO NOT BINAT' } else { 'Active' }
+                    ,@((& $c (XText $r 'interface')), (& $c (XText $r 'external')), (& $c $src.Addr), $st, (& $c (XText $r 'descr')))
+                })
+                Add-HuduTable $sb @('Interface','External IP','Internal','Status','Description') $rows $Format
+            }
+            if ($obNodes.Count -gt 0) {
+                Add-HuduHeading $sb 'Outbound NAT Rules' $Format 3
+                $rows = @(foreach ($r in $obNodes) {
+                    $src = Format-Endpoint $r.SelectSingleNode('source'); $dst = Format-Endpoint $r.SelectSingleNode('destination')
+                    $tgt = if (XHas $r 'nonat') { 'DO NOT NAT' } elseif (XText $r 'targetip') { XText $r 'targetip' } elseif (XText $r 'target') { XText $r 'target' } else { 'Interface address' }
+                    ,@((& $c (XText $r 'interface')), (& $c $src.Addr), (& $c $dst.Addr), (& $c $tgt), $(if (XHas $r 'disabled') { 'Disabled' } else { 'Active' }), (& $c (XText $r 'descr')))
+                })
+                Add-HuduTable $sb @('Interface','Source','Destination','Translation','Status','Description') $rows $Format
+            }
+        }
+    }
+
+    # 7. VPN (IPsec combined P1+P2, OpenVPN, WireGuard - never emit PSKs/keys)
+    $p1 = XNodes $Root 'ipsec/phase1'; $p2 = XNodes $Root 'ipsec/phase2'
+    $ovS = XNodes $Root 'openvpn/openvpn-server'; $ovC = XNodes $Root 'openvpn/openvpn-client'
+    $wgT = (XNodes $Root 'installedpackages/wireguard/tunnels/item') + (XNodes $Root 'wireguard/tunnels/item')
+    $wgP = (XNodes $Root 'installedpackages/wireguard/peers/item')   + (XNodes $Root 'wireguard/peers/item')
+    if ($p1.Count -gt 0 -or $ovS.Count -gt 0 -or $ovC.Count -gt 0 -or $wgT.Count -gt 0) {
+        Add-HuduHeading $sb 'VPN Configuration' $Format
+        if ($p1.Count -gt 0) {
+            Add-HuduHeading $sb 'IPsec Tunnels' $Format 3
+            $p2ByIke = @{}
+            foreach ($s2 in $p2) {
+                $id = XText $s2 'ikeid'
+                $lid = $s2.SelectSingleNode('localid'); $rid = $s2.SelectSingleNode('remoteid')
+                $loc = if (XText $lid 'address') { (XText $lid 'address') + $(if (XText $lid 'netbits') { '/' + (XText $lid 'netbits') } else { '' }) } else { XText $lid 'type' }
+                $rem = if (XText $rid 'address') { (XText $rid 'address') + $(if (XText $rid 'netbits') { '/' + (XText $rid 'netbits') } else { '' }) } else { XText $rid 'type' }
+                if (-not $p2ByIke.ContainsKey($id)) { $p2ByIke[$id] = New-Object 'System.Collections.Generic.List[string]' }
+                [void]$p2ByIke[$id].Add("$loc -> $rem")
+            }
+            $rows = @(foreach ($s1 in $p1) {
+                $id = XText $s1 'ikeid'
+                $nets = if ($p2ByIke.ContainsKey($id)) { ($p2ByIke[$id].ToArray()) -join '; ' } else { '' }
+                $auth = (XText $s1 'authentication_method') + $(if (XText $s1 'pre-shared-key') { ' (PSK in vault)' } else { '' })
+                ,@((& $c (XText $s1 'descr')), $(if (XHas $s1 'disabled') { 'Disabled' } else { 'Active' }), (& $c (XText $s1 'iketype')), (& $c (XText $s1 'remote-gateway')), (& $c $nets), (& $c $auth))
+            })
+            Add-HuduTable $sb @('Tunnel','Status','IKE','Remote Peer','Subnets (Local -> Remote)','Auth') $rows $Format
+        }
+        if ($ovS.Count -gt 0 -or $ovC.Count -gt 0) {
+            Add-HuduHeading $sb 'OpenVPN' $Format 3
+            $rows = New-Object 'System.Collections.Generic.List[object]'
+            foreach ($s in $ovS) {
+                $ep = (XText $s 'protocol') + '/' + (XText $s 'local_port')
+                [void]$rows.Add(@('Server', (& $c (XText $s 'description')), $(if ((XHas $s 'disable') -or (XHas $s 'disabled')) { 'Disabled' } else { 'Active' }), (& $c $ep), (& $c (XText $s 'tunnel_network')), (& $c (XText $s 'local_network')), (& $c (XText $s 'authmode'))))
+            }
+            foreach ($s in $ovC) {
+                $ep = (XText $s 'protocol') + ' ' + (XText $s 'server_addr') + ':' + (XText $s 'server_port')
+                [void]$rows.Add(@('Client', (& $c (XText $s 'description')), $(if ((XHas $s 'disable') -or (XHas $s 'disabled')) { 'Disabled' } else { 'Active' }), (& $c $ep), (& $c (XText $s 'tunnel_network')), (& $c (XText $s 'remote_network')), (& $c (XText $s 'authmode'))))
+            }
+            Add-HuduTable $sb @('Role','Description','Status','Proto / Endpoint','Tunnel Net','Local / Remote Net','Auth') $rows.ToArray() $Format
+        }
+        if ($wgT.Count -gt 0) {
+            Add-HuduHeading $sb 'WireGuard' $Format 3
+            $rows = @(foreach ($t in $wgT) {
+                $tn = XText $t 'name'
+                $ad = @((XNodes $t 'addresses/row') | ForEach-Object { (XText $_ 'address') + '/' + (XText $_ 'mask') }) -join ', '
+                $pr = @($wgP | Where-Object { (XText $_ 'tun') -eq $tn } | ForEach-Object { (XText $_ 'descr') + ' (' + (XText $_ 'endpoint') + ')' }) -join '; '
+                ,@((& $c $tn), $(if (Test-XmlEnabled $t @('enabled')) { 'Active' } else { 'Disabled' }), (& $c (XText $t 'listenport')), (& $c $ad), (& $c $pr), (& $c (XText $t 'descr')))
+            })
+            Add-HuduTable $sb @('Tunnel','Status','Port','Addresses','Peers','Description') $rows $Format
+        }
+    }
+
+    # 8. Firewall Rules (enabled rules only, grouped by interface)
+    $fwRules = XNodes $Root 'filter/rule'
+    if ($fwRules.Count -gt 0) {
+        Add-HuduHeading $sb 'Firewall Rules (Active)' $Format
+        $fwGroups = [ordered]@{}
+        $disabledCnt = 0
+        foreach ($r in $fwRules) {
+            if (XHas $r 'disabled') { $disabledCnt++; continue }
+            $k = if (XHas $r 'floating') { '(floating)' } else { XText $r 'interface' }
+            if (-not $k) { $k = '(floating)' }
+            if (-not $fwGroups.Contains($k)) { $fwGroups[$k] = New-Object 'System.Collections.Generic.List[object]' }
+            [void]$fwGroups[$k].Add($r)
+        }
+        foreach ($k in $fwGroups.Keys) {
+            $ifLbl = if ($script:IfMap.ContainsKey($k)) { "$k - $($script:IfMap[$k])" } else { $k }
+            Add-HuduHeading $sb $ifLbl $Format 3
+            $rows = @(foreach ($r in $fwGroups[$k]) {
+                $src = Format-Endpoint $r.SelectSingleNode('source'); $dst = Format-Endpoint $r.SelectSingleNode('destination')
+                $pr = XText $r 'protocol'; if (-not $pr) { $pr = 'any' }
+                ,@((& $c (XText $r 'type').ToUpperInvariant()), (& $c $pr), (& $c $src.Addr), (& $c $dst.Addr), (& $c $dst.Port), (& $c (XText $r 'gateway')), (& $c (XText $r 'descr')))
+            })
+            Add-HuduTable $sb @('Action','Proto','Source','Destination','Dst Port','Gateway','Description') $rows $Format
+        }
+        if ($disabledCnt -gt 0) {
+            if ($Format -eq 'Html') { [void]$sb.Append('<p style="color:#5a6573;font-size:12px;"><em>' + $disabledCnt + " disabled rule(s) omitted.</em></p>`n") }
+            else { [void]$sb.Append("_$disabledCnt disabled rule(s) omitted._`n`n") }
+        }
+    }
+
+    # 9. Aliases
+    $aliases = XNodes $Root 'aliases/alias'
+    if ($aliases.Count -gt 0) {
+        Add-HuduHeading $sb 'Aliases' $Format
+        $rows = @(foreach ($a in $aliases) {
+            $val = XText $a 'address'; if (-not $val) { $val = XText $a 'url' }
+            $val = (@($val -split '\s+' | Where-Object { $_ }) -join ', ')
+            ,@((& $c (XText $a 'name')), (& $c (XText $a 'type')), (& $c $val), (& $c (XText $a 'descr')))
+        })
+        Add-HuduTable $sb @('Name','Type','Contents','Description') $rows $Format
+    }
+
+    # 10. Certificates & Packages / Services Summary
+    $certs = XNodes $Root 'cert'
+    if ($certs.Count -gt 0) {
+        Add-HuduHeading $sb 'Certificates' $Format
+        $rows = @(foreach ($ct in $certs) {
+            $rid = XText $ct 'refid'; $info = Get-CertInfo (XText $ct 'crt')
+            $exp = if ($info.NotAfter) { $info.NotAfter.ToString('yyyy-MM-dd') } else { '' }
+            $uses = @(); if ($rid -and $script:RefUsageMap.ContainsKey($rid)) { $uses = @($script:RefUsageMap[$rid]) }
+            ,@((& $c (XText $ct 'descr')), (& $c $info.Subject 'dn'), (& $c $exp), (& $c ($uses -join ', ')))
+        })
+        Add-HuduTable $sb @('Name','Subject','Expires','Used By') $rows $Format
+    }
+
+    $pkgs = XNodes $Root 'installedpackages/package'
+    $snmp = $Root.SelectSingleNode('snmpd'); $syslog = $Root.SelectSingleNode('syslog'); $ddns = XNodes $Root 'dyndnses/dyndns'
+    $svcPairs = New-Object 'System.Collections.Generic.List[object]'
+    if ($null -ne $snmp -and (XHas $snmp 'enable')) { [void]$svcPairs.Add(@('SNMP', 'Enabled on ' + (& $c $(if (XText $snmp 'bindip') { XText $snmp 'bindip' } else { 'All' })) + ' (community in vault)')) }
+    if ($null -ne $syslog -and (XHas $syslog 'enable')) {
+        $svrs = @((XText $syslog 'remoteserver'), (XText $syslog 'remoteserver2'), (XText $syslog 'remoteserver3') | Where-Object { $_ }) -join ', '
+        [void]$svcPairs.Add(@('Remote Syslog', (& $c $svrs)))
+    }
+    if ($ddns.Count -gt 0) {
+        $dh = @(foreach ($d in $ddns) { if (XHas $d 'enable') { (XText $d 'host') + ' (' + (XText $d 'type') + ')' } }) -join ', '
+        if ($dh) { [void]$svcPairs.Add(@('Dynamic DNS', (& $c $dh))) }
+    }
+    if ($pkgs.Count -gt 0) {
+        $pl = @(foreach ($p in $pkgs) { (XText $p 'name') + ' ' + (XText $p 'version') }) -join ', '
+        [void]$svcPairs.Add(@('Installed Packages', (& $c $pl)))
+    }
+    if ($svcPairs.Count -gt 0) {
+        Add-HuduHeading $sb 'Services & Packages' $Format
+        Add-HuduKv $sb $svcPairs.ToArray() $Format
+    }
+
+    if ($Format -eq 'Html') {
+        [void]$sb.Append('<p style="color:#6c757d;font-size:11px;margin-top:16px;">Generated by pfsense_report.ps1 v' + $script:ToolVersion + ' (-Hudu). Passwords, PSKs, and private keys are omitted &mdash; store them in your Hudu Password Vault.</p></div>')
+    }
+    else {
+        [void]$sb.Append("---`n*Generated by pfsense_report.ps1 v$($script:ToolVersion) (-Hudu). Passwords, PSKs, and private keys are omitted - store them in your Hudu Password Vault.*`n")
+    }
+    return $sb.ToString()
+}
+
+# ==================================================================================
 #  MAIN ENTRYPOINT
 # ==================================================================================
 
@@ -2335,7 +2828,9 @@ function Invoke-PfSenseReport {
         [string]$ConfigPathValue, [string]$OutputPathValue, [bool]$RedactValue,
         [string]$TitleValue, [string]$LogoPathValue,
         [string[]]$WanInterfacesValue, [string[]]$InternalInterfacesValue,
-        [int]$ExpiryWarnDaysValue, [string]$JsonPathValue, [bool]$QuietValue
+        [int]$ExpiryWarnDaysValue, [string]$JsonPathValue,
+        [bool]$HuduValue = $false, [string]$HuduFormatValue = 'Html',
+        [bool]$QuietValue = $false
     )
 
     Initialize-ReportContext -RedactMode $RedactValue -ExpiryWarnDaysValue $ExpiryWarnDaysValue
@@ -2350,8 +2845,11 @@ function Invoke-PfSenseReport {
         throw "This does not appear to be a pfSense configuration (missing <pfsense> root element)."
     }
 
+    $normHuduFmt = if ($HuduFormatValue -match '(?i)^(markdown|md)$') { 'Markdown' } else { 'Html' }
     if ([string]::IsNullOrWhiteSpace($OutputPathValue)) {
-        $OutputPathValue = Join-Path (Get-Location).Path (([System.IO.Path]::GetFileNameWithoutExtension($resolvedConfig)) + '-report.html')
+        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($resolvedConfig)
+        $suffix = if ($HuduValue) { if ($normHuduFmt -eq 'Markdown') { '-hudu.md' } else { '-hudu.html' } } else { '-report.html' }
+        $OutputPathValue = Join-Path (Get-Location).Path ($baseName + $suffix)
     }
     $resolvedOutput = Resolve-FullPath $OutputPathValue
 
@@ -2418,99 +2916,105 @@ function Invoke-PfSenseReport {
     $infoCount = @($script:Findings | Where-Object { $_.Sev -eq 'info' }).Count
     $counts['findings'] = $cFind
 
-    $sectionsSb = New-Object System.Text.StringBuilder
-    $navSb      = New-Object System.Text.StringBuilder
-    foreach ($sd in $sectionDefs) {
-        [void]$sectionsSb.Append((Wrap-Section $sd.Id $sd.Title $sd.Summary $sd.Body))
-        $emptyCls = if ([string]::IsNullOrWhiteSpace($sd.Body)) { ' class="nav-empty"' } else { '' }
-        $cntVal   = if ($sd.CountKey) { $counts[$sd.CountKey] } else { 0 }
-        $cntBadge = if ($cntVal -gt 0) { '<span class="nav-cnt">' + $cntVal + '</span>' } else { '' }
-        [void]$navSb.Append('<a href="#' + $sd.Id + '"' + $emptyCls + '><span>' + [System.Net.WebUtility]::HtmlEncode($sd.Nav) + '</span>' + $cntBadge + '</a>')
-    }
-
-    # ---- Banners & Stat Cards ------------------------------------------------
-    $banners = New-Object System.Text.StringBuilder
-    $verMajor = 0.0
-    $verOk = [double]::TryParse($version, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$verMajor)
-    if (-not $version) {
-        [void]$banners.Append('<div class="warn-banner"><strong>Warning:</strong> No pfSense configuration version was found in this file. The report may be incomplete or this may not be a standard pfSense backup.</div>')
-    }
-    elseif (-not $verOk -or $verMajor -lt 15.0 -or $verMajor -gt 30.0) {
-        [void]$banners.Append('<div class="warn-banner"><strong>Warning:</strong> Configuration version &quot;' + (E $version) + '&quot; is outside the validated range (pfSense config versions 15.x&ndash;30.x). Some sections may not parse as expected.</div>')
-    }
-    if ($script:HasPlaintextSecret -and -not $script:IsRedacted) {
-        [void]$banners.Append('<div class="warn-banner"><strong>Confidentiality Notice:</strong> This report contains unredacted secrets (such as IPsec pre-shared keys or SNMP communities, hidden behind click-to-reveal). Treat this file as sensitive, or re-run with <code class="mono">-Redact</code> before sharing externally.</div>')
-    }
-
-    $riskCls = if ($highCount -gt 0) { 'sev-high' } elseif ($warnCount -gt 0) { 'sev-warn' } elseif ($infoCount -gt 0) { 'sev-info' } else { 'sev-ok' }
-    $statItems = New-Object 'System.Collections.Generic.List[object]'
-    foreach ($st in @(
-        @($counts.interfaces,    'Interfaces',     ''),
-        @($counts.firewallRules, 'Firewall rules', ''),
-        @($counts.portForwards,  'Port forwards',  ''),
-        @($counts.ipsecTunnels,  'IPsec tunnels',  ''),
-        @($counts.openVpn,       'OpenVPN',        '')
-    )) { [void]$statItems.Add($st) }
-    if ($counts.wireGuard -gt 0) { [void]$statItems.Add(@($counts.wireGuard, 'WireGuard', '')) }
-    [void]$statItems.Add(@($counts.certsAndCas, 'Certs / CAs', ''))
-    [void]$statItems.Add(@($cFind,              'Risk flags',  $riskCls))
-
-    $cardsSb = New-Object System.Text.StringBuilder
-    [void]$cardsSb.Append('<div class="cards">')
-    foreach ($st in $statItems) {
-        $nCls = if ($st[2]) { 'n ' + $st[2] } else { 'n' }
-        [void]$cardsSb.Append('<div class="card"><div class="' + $nCls + '">' + $st[0] + '</div><div class="l">' + $st[1] + '</div></div>')
-    }
-    [void]$cardsSb.Append('</div>')
-
-    # ---- Cover, Sidebar, Search & Final HTML ---------------------------------
     $genTime  = $script:Now.ToString('yyyy-MM-dd HH:mm:ss zzz')
     $hostDisp = if (-not $hostname) { 'unknown' } elseif ($script:IsRedacted) { Get-RedactToken $hostname.ToLowerInvariant() 'HOST' } else { $hostname }
     $domDisp  = if (-not $domain)   { '' }        elseif ($script:IsRedacted) { Get-RedactToken $domain.ToLowerInvariant() 'DOMAIN' } else { $domain }
     $fqdn     = if ($domDisp) { "$hostDisp.$domDisp" } else { $hostDisp }
 
-    $cover = '<div class="cover"><div class="cover-top">' + (Get-LogoTag $LogoPathValue) +
-             '<div><h1>' + (E $TitleValue) + '</h1><div class="sub">Generated by pfsense_report.ps1 v' + $script:ToolVersion + $(if ($script:IsRedacted) { ' &mdash; REDACTED COPY' } else { '' }) + '</div></div></div>' +
-             '<div class="meta">' +
-             '<div><span>Hostname</span><strong>' + [System.Net.WebUtility]::HtmlEncode($fqdn) + '</strong></div>' +
-             '<div><span>pfSense config version</span><strong>' + $(if ($version) { [System.Net.WebUtility]::HtmlEncode($version) } else { 'unknown' }) + '</strong></div>' +
-             '<div><span>Report generated</span><strong>' + [System.Net.WebUtility]::HtmlEncode($genTime) + '</strong></div>' +
-             '<div><span>Source file</span><strong>' + $(if ($script:IsRedacted) { '[redacted]' } else { [System.Net.WebUtility]::HtmlEncode([System.IO.Path]::GetFileName($resolvedConfig)) }) + '</strong></div>' +
-             '</div></div>'
+    $outContent = ''
+    if ($HuduValue) {
+        $outContent = Build-HuduReport -Root $root -Format $normHuduFmt -TitleValue $TitleValue -Fqdn $fqdn -Version $version -GenTime $genTime
+    }
+    else {
+        $sectionsSb = New-Object System.Text.StringBuilder
+        $navSb      = New-Object System.Text.StringBuilder
+        foreach ($sd in $sectionDefs) {
+            [void]$sectionsSb.Append((Wrap-Section $sd.Id $sd.Title $sd.Summary $sd.Body))
+            $emptyCls = if ([string]::IsNullOrWhiteSpace($sd.Body)) { ' class="nav-empty"' } else { '' }
+            $cntVal   = if ($sd.CountKey) { $counts[$sd.CountKey] } else { 0 }
+            $cntBadge = if ($cntVal -gt 0) { '<span class="nav-cnt">' + $cntVal + '</span>' } else { '' }
+            [void]$navSb.Append('<a href="#' + $sd.Id + '"' + $emptyCls + '><span>' + [System.Net.WebUtility]::HtmlEncode($sd.Nav) + '</span>' + $cntBadge + '</a>')
+        }
 
-    $sidebarBrand = if (-not $hostname) { '' } elseif ($script:IsRedacted) { [System.Net.WebUtility]::HtmlEncode((Get-RedactToken $hostname.ToLowerInvariant() 'HOST')) } else { [System.Net.WebUtility]::HtmlEncode($hostname) }
-    $sidebar = '<aside class="sidebar"><div class="brand">pfSense Report<small>' + $sidebarBrand + '</small></div>' +
-               '<label for="navfilter" class="sr-only">Filter sections</label>' +
-               '<input id="navfilter" class="navfilter" type="search" placeholder="Filter sections..." aria-label="Filter sections" />' +
-               '<div class="navtools"><button type="button" id="btn-expand-all">Expand all</button><button type="button" id="btn-collapse-all">Collapse all</button>' +
-               '<button type="button" id="btn-print">Print / PDF</button><button type="button" id="btn-theme">Dark theme</button></div>' +
-               '<nav aria-label="Report sections">' + $navSb.ToString() + '</nav></aside>'
+        $banners = New-Object System.Text.StringBuilder
+        $verMajor = 0.0
+        $verOk = [double]::TryParse($version, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$verMajor)
+        if (-not $version) {
+            [void]$banners.Append('<div class="warn-banner"><strong>Warning:</strong> No pfSense configuration version was found in this file. The report may be incomplete or this may not be a standard pfSense backup.</div>')
+        }
+        elseif (-not $verOk -or $verMajor -lt 15.0 -or $verMajor -gt 30.0) {
+            [void]$banners.Append('<div class="warn-banner"><strong>Warning:</strong> Configuration version &quot;' + (E $version) + '&quot; is outside the validated range (pfSense config versions 15.x&ndash;30.x). Some sections may not parse as expected.</div>')
+        }
+        if ($script:HasPlaintextSecret -and -not $script:IsRedacted) {
+            [void]$banners.Append('<div class="warn-banner"><strong>Confidentiality Notice:</strong> This report contains unredacted secrets (such as IPsec pre-shared keys or SNMP communities, hidden behind click-to-reveal). Treat this file as sensitive, or re-run with <code class="mono">-Redact</code> before sharing externally.</div>')
+        }
 
-    $searchBar = '<div class="search-bar"><label for="global-search" class="sr-only">Search report tables</label>' +
-                 '<input id="global-search" type="search" placeholder="Search rules, IPs, ports, aliases, hosts, packages..." aria-label="Search report tables" />' +
-                 '<span id="global-search-status" class="search-status" aria-live="polite"></span>' +
-                 '<button type="button" id="global-search-clear">Clear</button></div>'
+        $riskCls = if ($highCount -gt 0) { 'sev-high' } elseif ($warnCount -gt 0) { 'sev-warn' } elseif ($infoCount -gt 0) { 'sev-info' } else { 'sev-ok' }
+        $statItems = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($st in @(
+            @($counts.interfaces,    'Interfaces',     ''),
+            @($counts.firewallRules, 'Firewall rules', ''),
+            @($counts.portForwards,  'Port forwards',  ''),
+            @($counts.ipsecTunnels,  'IPsec tunnels',  ''),
+            @($counts.openVpn,       'OpenVPN',        '')
+        )) { [void]$statItems.Add($st) }
+        if ($counts.wireGuard -gt 0) { [void]$statItems.Add(@($counts.wireGuard, 'WireGuard', '')) }
+        [void]$statItems.Add(@($counts.certsAndCas, 'Certs / CAs', ''))
+        [void]$statItems.Add(@($cFind,              'Risk flags',  $riskCls))
 
-    $footer = '<div class="footer">Generated locally by pfsense_report.ps1 v' + $script:ToolVersion + ' &mdash; no data left this machine. Heuristic risk flags are informational and do not replace a manual security review.</div>'
-    $csp    = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline';"
+        $cardsSb = New-Object System.Text.StringBuilder
+        [void]$cardsSb.Append('<div class="cards">')
+        foreach ($st in $statItems) {
+            $nCls = if ($st[2]) { 'n ' + $st[2] } else { 'n' }
+            [void]$cardsSb.Append('<div class="card"><div class="' + $nCls + '">' + $st[0] + '</div><div class="l">' + $st[1] + '</div></div>')
+        }
+        [void]$cardsSb.Append('</div>')
 
-    $docSb = New-Object System.Text.StringBuilder
-    [void]$docSb.Append('<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">')
-    [void]$docSb.Append('<meta name="color-scheme" content="light dark"><meta http-equiv="Content-Security-Policy" content="' + $csp + '">')
-    [void]$docSb.Append('<title>' + (E $TitleValue) + '</title><style>' + $script:ReportCss + '</style></head><body>')
-    [void]$docSb.Append('<a class="skip-link" href="#main-content">Skip to report content</a>').Append($sidebar)
-    [void]$docSb.Append('<main id="main-content" class="main">').Append($cover).Append($banners.ToString()).Append($cardsSb.ToString()).Append($searchBar).Append($sectionsSb.ToString()).Append($footer)
-    [void]$docSb.Append('</main><script>' + $script:ReportJs + '</script></body></html>')
+        $cover = '<div class="cover"><div class="cover-top">' + (Get-LogoTag $LogoPathValue) +
+                 '<div><h1>' + (E $TitleValue) + '</h1><div class="sub">Generated by pfsense_report.ps1 v' + $script:ToolVersion + $(if ($script:IsRedacted) { ' &mdash; REDACTED COPY' } else { '' }) + '</div></div></div>' +
+                 '<div class="meta">' +
+                 '<div><span>Hostname</span><strong>' + [System.Net.WebUtility]::HtmlEncode($fqdn) + '</strong></div>' +
+                 '<div><span>pfSense config version</span><strong>' + $(if ($version) { [System.Net.WebUtility]::HtmlEncode($version) } else { 'unknown' }) + '</strong></div>' +
+                 '<div><span>Report generated</span><strong>' + [System.Net.WebUtility]::HtmlEncode($genTime) + '</strong></div>' +
+                 '<div><span>Source file</span><strong>' + $(if ($script:IsRedacted) { '[redacted]' } else { [System.Net.WebUtility]::HtmlEncode([System.IO.Path]::GetFileName($resolvedConfig)) }) + '</strong></div>' +
+                 '</div></div>'
+
+        $sidebarBrand = if (-not $hostname) { '' } elseif ($script:IsRedacted) { [System.Net.WebUtility]::HtmlEncode((Get-RedactToken $hostname.ToLowerInvariant() 'HOST')) } else { [System.Net.WebUtility]::HtmlEncode($hostname) }
+        $sidebar = '<aside class="sidebar"><div class="brand">pfSense Report<small>' + $sidebarBrand + '</small></div>' +
+                   '<label for="navfilter" class="sr-only">Filter sections</label>' +
+                   '<input id="navfilter" class="navfilter" type="search" placeholder="Filter sections..." aria-label="Filter sections" />' +
+                   '<div class="navtools"><button type="button" id="btn-expand-all">Expand all</button><button type="button" id="btn-collapse-all">Collapse all</button>' +
+                   '<button type="button" id="btn-print">Print / PDF</button><button type="button" id="btn-theme">Dark theme</button></div>' +
+                   '<nav aria-label="Report sections">' + $navSb.ToString() + '</nav></aside>'
+
+        $searchBar = '<div class="search-bar"><label for="global-search" class="sr-only">Search report tables</label>' +
+                     '<input id="global-search" type="search" placeholder="Search rules, IPs, ports, aliases, hosts, packages..." aria-label="Search report tables" />' +
+                     '<span id="global-search-status" class="search-status" aria-live="polite"></span>' +
+                     '<button type="button" id="global-search-clear">Clear</button></div>'
+
+        $footer = '<div class="footer">Generated locally by pfsense_report.ps1 v' + $script:ToolVersion + ' &mdash; no data left this machine. Heuristic risk flags are informational and do not replace a manual security review.</div>'
+        $csp    = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline';"
+
+        $docSb = New-Object System.Text.StringBuilder
+        [void]$docSb.Append('<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">')
+        [void]$docSb.Append('<meta name="color-scheme" content="light dark"><meta http-equiv="Content-Security-Policy" content="' + $csp + '">')
+        [void]$docSb.Append('<title>' + (E $TitleValue) + '</title><style>' + $script:ReportCss + '</style></head><body>')
+        [void]$docSb.Append('<a class="skip-link" href="#main-content">Skip to report content</a>').Append($sidebar)
+        [void]$docSb.Append('<main id="main-content" class="main">').Append($cover).Append($banners.ToString()).Append($cardsSb.ToString()).Append($searchBar).Append($sectionsSb.ToString()).Append($footer)
+        [void]$docSb.Append('</main><script>' + $script:ReportJs + '</script></body></html>')
+        $outContent = $docSb.ToString()
+    }
 
     $outDir = [System.IO.Path]::GetDirectoryName($resolvedOutput)
     if (-not [string]::IsNullOrWhiteSpace($outDir) -and -not (Test-Path -LiteralPath $outDir)) { [void](New-Item -ItemType Directory -Path $outDir -Force) }
     $utf8 = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($resolvedOutput, $docSb.ToString(), $utf8)
+    [System.IO.File]::WriteAllText($resolvedOutput, $outContent, $utf8)
 
     $summaryObj = [pscustomobject]@{
         toolVersion   = $script:ToolVersion
         generatedAt   = $genTime
         redacted      = $script:IsRedacted
+        mode          = if ($HuduValue) { "Hudu-$normHuduFmt" } else { 'Full-Html' }
         hostname      = $fqdn
         configVersion = $version
         outputPath    = $resolvedOutput
@@ -2541,18 +3045,29 @@ function Invoke-PfSenseReport {
 
     if (-not $QuietValue) {
         Write-Host "pfSense report written to: $resolvedOutput" -ForegroundColor Green
-        Write-Host ("{0} sections rendered, {1} risk flag(s) raised ({2} high, {3} warn, {4} info)." -f $sectionDefs.Count, $cFind, $highCount, $warnCount, $infoCount)
+        if ($HuduValue) {
+            Write-Host ("Hudu {0} summary rendered ({1} high, {2} warn alert(s))." -f $normHuduFmt, $highCount, $warnCount)
+        }
+        else {
+            Write-Host ("{0} sections rendered, {1} risk flag(s) raised ({2} high, {3} warn, {4} info)." -f $sectionDefs.Count, $cFind, $highCount, $warnCount, $infoCount)
+        }
     }
     return $summaryObj
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
     try {
+        $useHudu = [bool]$Hudu -or $PSBoundParameters.ContainsKey('HuduFormat')
+        $effHuduFmt = $HuduFormat
+        if ($useHudu -and -not $PSBoundParameters.ContainsKey('HuduFormat') -and $OutputPath -match '\.(md|markdown)$') {
+            $effHuduFmt = 'Markdown'
+        }
         $result = Invoke-PfSenseReport `
             -ConfigPathValue $ConfigPath -OutputPathValue $OutputPath -RedactValue ([bool]$Redact) `
             -TitleValue $Title -LogoPathValue $LogoPath `
             -WanInterfacesValue $WanInterfaces -InternalInterfacesValue $InternalInterfaces `
-            -ExpiryWarnDaysValue $ExpiryWarnDays -JsonPathValue $JsonPath -QuietValue ([bool]$Quiet)
+            -ExpiryWarnDaysValue $ExpiryWarnDays -JsonPathValue $JsonPath `
+            -HuduValue $useHudu -HuduFormatValue $effHuduFmt -QuietValue ([bool]$Quiet)
         if ($PassThru) { $result }
         exit 0
     }

@@ -290,6 +290,28 @@ try {
     & $exe -NoProfile -ExecutionPolicy Bypass -Command "Set-Location -LiteralPath '$relDir'; & '$ScriptPath' -ConfigPath '$Fixture' -OutputPath 'relative-out.html' -Quiet" | Out-Null
     Check "relative -OutputPath respects PowerShell Set-Location CWD" (Test-Path -LiteralPath (Join-Path $relDir 'relative-out.html'))
 
+    # Hudu compact HTML fragment & Markdown exports
+    $huduHtmlOut = Join-Path $tmpRoot 'hudu-out.html'
+    $huduMdOut   = Join-Path $tmpRoot 'hudu-out.md'
+    $huduRedMd   = Join-Path $tmpRoot 'hudu-redacted.md'
+    Check "Hudu HTML run exits 0" ((Invoke-ReportCli @('-ConfigPath', $Fixture, '-OutputPath', $huduHtmlOut, '-Hudu', '-Quiet')) -eq 0)
+    $hh = if (Test-Path -LiteralPath $huduHtmlOut) { [System.IO.File]::ReadAllText($huduHtmlOut) } else { '' }
+    Check "Hudu HTML is a clean paste-ready fragment (no DOCTYPE/style/script)" (-not ($hh -match '<!DOCTYPE|<style>|<script>'))
+    Check "Hudu HTML omits empty sections and includes core tables" ($hh -match 'System Overview' -and $hh -match 'Interfaces' -and $hh -match 'IPsec Tunnels' -and -not ($hh -match 'Not configured\.'))
+    Check "Hudu HTML includes HIGH/WARN alerts without NO LOG info noise" ($hh -match 'Key Security Alerts' -and $hh -match 'HIGH RISK' -and -not ($hh -match '\[NO LOG\]'))
+    Check "Hudu HTML never leaks PSKs or private keys" (-not ($hh -match 'EXAMPLEPSKdonotuse') -and -not ($hh -match 'NOT-A-REAL-PRIVATE-KEY') -and $hh -match 'PSK in vault')
+
+    # Auto-detect Markdown from .md output path
+    Check "Hudu Markdown (.md auto-detect) exits 0" ((Invoke-ReportCli @('-ConfigPath', $Fixture, '-OutputPath', $huduMdOut, '-Hudu', '-Quiet')) -eq 0)
+    $hm = if (Test-Path -LiteralPath $huduMdOut) { [System.IO.File]::ReadAllText($huduMdOut) } else { '' }
+    Check "Hudu Markdown uses GFM headings and tables" ($hm -match '^# ' -and $hm -match '## Interfaces' -and $hm -match '\| Key \| Description \|')
+    Check "Hudu Markdown omits PSKs and combines IPsec P1+P2 subnets" (-not ($hm -match 'EXAMPLEPSKdonotuse') -and $hm -match 'lan -> 203\.0\.113\.0/24')
+
+    # Hudu Markdown + Redact
+    Check "Hudu Markdown + -Redact exits 0" ((Invoke-ReportCli @('-ConfigPath', $Fixture, '-OutputPath', $huduRedMd, '-Hudu', '-HuduFormat', 'Markdown', '-Redact', '-Quiet')) -eq 0)
+    $hrm = if (Test-Path -LiteralPath $huduRedMd) { [System.IO.File]::ReadAllText($huduRedMd) } else { '' }
+    Check "Hudu Markdown + -Redact masks IPs/MACs/hosts and omits PSK" (-not ($hrm -match '192\.0\.2\.1\b') -and -not ($hrm -match 'EXAMPLEPSKdonotuse') -and $hrm -match 'IP-\d{3}' -and $hrm -match 'MAC-\d{3}')
+
     # ==============================================================================
     # 5. Negative error handling (missing file, directory, XXE, invalid XML, wrong root)
     # ==============================================================================
