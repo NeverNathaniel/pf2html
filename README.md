@@ -6,6 +6,8 @@ PowerShell modules. The output is a single `.html` file you can open in any mode
 on an air-gapped machine and print to PDF (File → Print → Save as PDF).
 
 [![CI](https://github.com/NeverNathaniel/pf2html/actions/workflows/ci.yml/badge.svg)](https://github.com/NeverNathaniel/pf2html/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/NeverNathaniel/pf2html)](https://github.com/NeverNathaniel/pf2html/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 ![Report overview — cover, stat cards and severity-sorted Security Findings](docs/screenshot.png)
 
@@ -71,6 +73,9 @@ on an air-gapped machine and print to PDF (File → Print → Save as PDF).
   PowerShell 7+ across Windows, Linux, and macOS — exercised in CI on every push.
 
 ## Usage
+
+Download `pfsense_report.ps1` (with SHA-256 checksums) from the
+[latest GitHub Release](https://github.com/NeverNathaniel/pf2html/releases/latest), then run:
 
 ```powershell
 .\pfsense_report.ps1 -ConfigPath "config.xml" -OutputPath "report.html"

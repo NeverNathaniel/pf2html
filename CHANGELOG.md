@@ -53,5 +53,5 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Pure-ASCII source + UTF-8 BOM for Windows PowerShell 5.1 and PowerShell 7 compatibility.
 
 [Unreleased]: https://github.com/NeverNathaniel/pf2html/compare/v1.1.0...HEAD
-[1.1.0]: https://github.com/NeverNathaniel/pf2html/compare/v1.0.0...v1.1.0
-[1.0.0]: https://github.com/NeverNathaniel/pf2html/releases/tag/v1.0.0
+[1.1.0]: https://github.com/NeverNathaniel/pf2html/releases/tag/v1.1.0
+[1.0.0]: https://github.com/NeverNathaniel/pf2html/commit/58df6c8d748278e701456c64590e003ec28a9aa8
