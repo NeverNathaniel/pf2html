@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to release (e.g. v1.0.0)'
+        description: 'Tag to release (e.g. v1.1.0)'
         required: true
 
 permissions:
@@ -19,6 +19,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: PSScriptAnalyzer (fail on Error/Warning)
+        shell: pwsh
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          if (-not (Get-Module -ListAvailable PSScriptAnalyzer)) {
+            Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          }
+          $results = Invoke-ScriptAnalyzer -Path ./pfsense_report.ps1 -Settings ./PSScriptAnalyzerSettings.psd1
+          if ($results) { $results | Format-Table -AutoSize | Out-String | Write-Host }
+          $blocking = @($results | Where-Object { $_.Severity -in @('Error','ParseError','Warning') })
+          if ($blocking.Count -gt 0) {
+            Write-Error ("PSScriptAnalyzer reported {0} blocking issue(s)." -f $blocking.Count)
+            exit 1
+          }
+
       - name: Validate on PowerShell 7
         shell: pwsh
         run: ./tests/Invoke-Tests.ps1
@@ -27,19 +42,27 @@ jobs:
         shell: powershell
         run: ./tests/Invoke-Tests.ps1
 
-      - name: Resolve version
+      - name: Resolve and validate version
         id: ver
         shell: pwsh
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
-          $tag = if ($env:GITHUB_REF_NAME -like 'v*') { $env:GITHUB_REF_NAME } else { '${{ github.event.inputs.tag }}' }
+          $tag = if ($env:GITHUB_REF_NAME -like 'v*') { $env:GITHUB_REF_NAME } else { $env:INPUT_TAG }
           if ([string]::IsNullOrWhiteSpace($tag)) { Write-Error 'No tag resolved.'; exit 1 }
-          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          if ($tag -notmatch '^v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') {
+            Write-Error "Invalid semver tag format: $tag"
+            exit 1
+          }
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           Write-Host "Releasing $tag"
 
       - name: Package
         shell: pwsh
+        env:
+          RELEASE_TAG: ${{ steps.ver.outputs.tag }}
         run: |
-          $tag   = '${{ steps.ver.outputs.tag }}'
+          $tag   = $env:RELEASE_TAG
           $stage = "pfsense_report-$tag"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           foreach ($f in 'pfsense_report.ps1','README.md','LICENSE','CHANGELOG.md') {
@@ -47,9 +70,11 @@ jobs:
           }
           $zip = "$stage.zip"
           Compress-Archive -Path "$stage/*" -DestinationPath $zip -Force
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
           foreach ($f in @($zip,'pfsense_report.ps1')) {
-            $hash = (Get-FileHash $f -Algorithm SHA256).Hash
-            "$hash  $([System.IO.Path]::GetFileName($f))" | Out-File "$f.sha256" -Encoding ascii
+            $hash = (Get-FileHash $f -Algorithm SHA256).Hash.ToLowerInvariant()
+            $line = "$hash  $([System.IO.Path]::GetFileName($f))`n"
+            [System.IO.File]::WriteAllText("$f.sha256", $line, $utf8NoBom)
           }
           Get-ChildItem "$zip","$zip.sha256","pfsense_report.ps1.sha256" | Format-Table Name,Length
 
@@ -57,7 +82,8 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.ver.outputs.tag }}
         run: |
-          $tag = '${{ steps.ver.outputs.tag }}'
+          $tag = $env:RELEASE_TAG
           $assets = @("pfsense_report-$tag.zip", "pfsense_report-$tag.zip.sha256", "pfsense_report.ps1", "pfsense_report.ps1.sha256")
           gh release create $tag --title "pfSense Report $tag" --generate-notes @assets

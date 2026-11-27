@@ -11,27 +11,33 @@ permissions:
   contents: read
 
 jobs:
-  validate:
-    name: Lint & test (Windows)
+  validate-windows:
+    name: Lint & test (Windows PS 5.1 + PS 7)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: PSScriptAnalyzer (fail only on errors)
+      - name: PSScriptAnalyzer (fail on Error/Warning)
         shell: pwsh
         run: |
           Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
           if (-not (Get-Module -ListAvailable PSScriptAnalyzer)) {
             Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
           }
-          $results = Invoke-ScriptAnalyzer -Path ./pfsense_report.ps1 -Settings ./PSScriptAnalyzerSettings.psd1
-          if ($results) { $results | Format-Table -AutoSize | Out-String | Write-Host }
-          $errors = @($results | Where-Object { $_.Severity -in @('Error','ParseError') })
-          if ($errors.Count -gt 0) {
-            Write-Error ("PSScriptAnalyzer reported {0} error(s)." -f $errors.Count)
+          $targets = @('./pfsense_report.ps1', './tests/Invoke-Tests.ps1')
+          $allResults = @()
+          foreach ($t in $targets) {
+            $allResults += Invoke-ScriptAnalyzer -Path $t -Settings ./PSScriptAnalyzerSettings.psd1
+          }
+          if ($allResults.Count -gt 0) {
+            $allResults | Format-Table -AutoSize | Out-String | Write-Host
+          }
+          $blocking = @($allResults | Where-Object { $_.Severity -in @('Error','ParseError','Warning') })
+          if ($blocking.Count -gt 0) {
+            Write-Error ("PSScriptAnalyzer reported {0} blocking issue(s)." -f $blocking.Count)
             exit 1
           }
-          Write-Host "No analyzer errors."
+          Write-Host "PSScriptAnalyzer: no errors or warnings."
 
       - name: Tests on PowerShell 7
         shell: pwsh
@@ -40,3 +46,39 @@ jobs:
       - name: Tests on Windows PowerShell 5.1
         shell: powershell
         run: ./tests/Invoke-Tests.ps1
+
+  validate-linux:
+    name: Cross-platform test & JS/encoding checks (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify pure-ASCII + UTF-8 BOM encoding
+        shell: bash
+        run: |
+          python3 -c '
+          raw = open("pfsense_report.ps1", "rb").read()
+          assert raw.startswith(b"\xef\xbb\xbf"), "Missing UTF-8 BOM on pfsense_report.ps1"
+          text = raw.decode("utf-8-sig")
+          non_ascii = [(i+1, c) for i, l in enumerate(text.splitlines()) for c in l if ord(c) > 127]
+          assert not non_ascii, f"Non-ASCII characters found: {non_ascii[:5]}"
+          print("Encoding check passed: pure ASCII + UTF-8 BOM.")
+          '
+
+      - name: Tests on Linux PowerShell 7
+        shell: pwsh
+        run: ./tests/Invoke-Tests.ps1
+
+      - name: Validate embedded JavaScript syntax
+        shell: bash
+        run: |
+          pwsh -NoProfile -File ./pfsense_report.ps1 -ConfigPath ./tests/fixtures/sample-config.xml -OutputPath /tmp/ci-report.html -Quiet
+          python3 -c '
+          import re
+          h = open("/tmp/ci-report.html", encoding="utf-8").read()
+          m = re.search(r"<script>(.*?)</script>", h, re.S)
+          assert m, "Missing <script> tag in generated HTML"
+          open("/tmp/ci-report.js", "w", encoding="utf-8").write(m.group(1))
+          '
+          node --check /tmp/ci-report.js
+          echo "Embedded JavaScript syntax OK."
