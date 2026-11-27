@@ -115,7 +115,7 @@ $ErrorActionPreference = 'Stop'
 # ----------------------------------------------------------------------------------
 #  Script-scoped state & constants
 # ----------------------------------------------------------------------------------
-$script:ToolVersion = '1.1.0'
+$script:ToolVersion = '1.2.0'
 
 function Initialize-ReportContext {
     param(

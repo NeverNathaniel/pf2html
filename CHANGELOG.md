@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [1.2.0] - 2026-11-27
 ### Added
 - Compact **Hudu / KB export mode** (`-Hudu`, `-HuduFormat Html|Markdown`): produces a clean, paste-ready inline-styled HTML fragment or GFM Markdown summary with only the essential setup details (empty sections omitted, disabled firewall rules omitted with a count note, IPsec Phase 1+2 combined, high/warn alerts highlighted, and all PSKs/secrets omitted for password-vault storage). Auto-selects Markdown when `-OutputPath` ends in `.md` or `.markdown`.
 
@@ -54,6 +56,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   responsive layout, and keyboard/ARIA support.
 - Pure-ASCII source + UTF-8 BOM for Windows PowerShell 5.1 and PowerShell 7 compatibility.
 
-[Unreleased]: https://github.com/NeverNathaniel/pf2html/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/NeverNathaniel/pf2html/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/NeverNathaniel/pf2html/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/NeverNathaniel/pf2html/releases/tag/v1.1.0
 [1.0.0]: https://github.com/NeverNathaniel/pf2html/commit/58df6c8d748278e701456c64590e003ec28a9aa8
